@@ -456,75 +456,124 @@ static class NullableMonad
 
 ---
 
-## Decision Point 6: Creating an API Endpoint
+## Decision Point 6: Designing a Feature Library's Public API
 
-Zoran exclusively uses Minimal API with no ControllerBase classes. Every endpoint is a static method on a static class, registered in `Program.cs` via method group delegates. This style eliminates controller overhead, makes dependency injection explicit in the method signature, and enables the compiler to infer OpenAPI metadata directly from return types.
+A feature ships as a self-contained class library whose "API" is the set of public interfaces and extension methods a consumer sees — not HTTP routes. Every domain model, value object, entity, EF Core configuration class, and internal service is `internal`. The consumer adds the feature with a single `services.AddFeatureXxx()` call and interacts through one or two public interfaces. That is the entire integration surface.
 
 ### MUST
-- MUST declare endpoint handlers as `public static` methods in a `public static class`. **Rationale**: Static classes have no instance state, ensuring the handler is a pure function of its parameters.
-- MUST return `Task<IResult>` or `Task<Results<Ok<T>, ProblemHttpResult>>` from every endpoint method. **Rationale**: Typed result unions enable automatic OpenAPI response metadata without `[Produces]` attributes.
-- MUST inject dependencies as method parameters — never resolve them from `HttpContext`. **Rationale**: Parameter injection makes the handler trivially testable by passing mock dependencies directly. For data access, inject the `DbContext` directly rather than repository abstractions.
-- MUST register routes in `Program.cs` using method group delegates: `app.MapGet("/path", ClassName.MethodName)`. **Rationale**: Method group delegates avoid closure allocations and expose the delegate's parameter metadata to the framework.
+- MUST expose exactly one or two `public interface` types as the consumer's sole entry point to the feature. Example: `IMoneyTransferService`, `IInvoiceGenerator`. **Rationale**: A single entry-point interface tells the consumer "here is everything this feature can do" without forcing them to discover multiple scattered types. Two interfaces is acceptable when read and write paths have meaningfully different contracts.
+- MUST keep domain models, entities, value objects, EF Core configuration, and internal services as `internal`. **Rationale**: The domain is the feature's private implementation. Exposing an `AccountId` or `Money` type to consumers couples them to internal representations; changes to domain types should never break consumers.
+- MUST provide an `IServiceCollection` extension method that registers the entire feature in one call: `services.AddTransfers(configuration)`. **Rationale**: A single registration call replaces the consumer's need to understand the feature's internal dependency graph — one `AddXxx()` and the feature is wired.
+- MUST return DTOs and result records from public interface methods — never domain entities or value objects. **Rationale**: DTOs form an explicit, versionable contract between the feature and its consumers. Returning a domain object leaks the internal model and breaks consumers when the model evolves.
+- MUST validate inputs at the public interface boundary before they reach domain logic. **Rationale**: The public API is the trust boundary between the outside world and the domain's make-invalid-unrepresentable guarantees; `.TryCreate()` calls and null checks belong here, not buried in internal services.
 
 ### SHOULD
-- SHOULD match route template parameter names to the handler's parameter names exactly. **Rationale**: ASP.NET Minimal API binds route values by name convention — mismatched names silently fail to bind.
-- SHOULD inject the `DbContext` directly as a method parameter rather than wrapping it in repository interfaces. **Rationale**: The `DbContext` already provides `DbSet<T>` properties, `Add()`, `Remove()`, and `SaveChangesAsync()` — an extra abstraction layer adds indirection without value. (Note: Zoran's codebase does demonstrate `IRepository<TAggregate,TKey>` + `IUnitOfWork` as an *advanced* DDD pattern, but for teaching purposes prefer direct `DbContext` injection.)
-- SHOULD validate inputs inside the handler and return `Results.BadRequest()` with structured error objects rather than throwing. **Rationale**: Returning error results from the handler keeps the HTTP pipeline exception-free and produces consistent 400 responses.
+- SHOULD use the Options pattern (`IOptions<FeatureOptions>`) for feature configuration, with static defaults so `AddTransfers()` works with zero additional setup. **Rationale**: Options classes self-document every configurable knob; sensible defaults mean the consumer overrides only what they need.
+- SHOULD design public interface methods as stateless pure functions of their parameters — pass `DbContext` or other dependencies at the implementation level, not on the interface itself. **Rationale**: Stateless signatures are trivially testable; stateful interface methods hide side effects and make callers guess which method must be called first.
+- SHOULD colocate the DI registration extension method inside the feature library itself, in the `Microsoft.Extensions.DependencyInjection` namespace. **Rationale**: The library owns its registration contract; the consumer only needs a `using` directive and a package reference.
+- SHOULD return `Task<T?>` or a result union from methods where failure is expected and recoverable — never throw across the public API boundary for business-rule rejections. **Rationale**: Exceptions are for programmer errors; nullable returns and result types are for "this input wasn't valid, try again" — they force the caller to confront the failure path.
 
 ### MAY
-- MAY use expression-bodied methods for simple query endpoints that read and return without side effects. **Rationale**: Single-expression reads are self-documenting and reduce ceremony for trivial lookups.
+- MAY use `InternalsVisibleTo` for the feature's test project only — never for sibling feature libraries. **Rationale**: Tests need internal access to arrange state and verify invariants; sibling features communicate exclusively through the public API to maintain decoupling.
+- MAY provide a separate `.Abstractions` project containing only interfaces and DTOs when the feature is consumed across process boundaries or by multiple alternative implementations. **Rationale**: An abstractions package lets consumers reference contracts without pulling in the implementation's full transitive dependency graph.
+- MAY define a `FeatureXxxOptions` record with a static `Default` property and reasonable initial values. **Rationale**: A default instance enables zero-configuration `AddTransfers()` calls while the Options pattern still allows override from `appsettings.json` or environment variables.
 
-<!-- File: code-openapi-docs/.../Api/Companies.cs (injecting DbContext/Repository; simplified version preferred for teaching) -->
+<!-- File: FeatureLibraries/Transfers/IMoneyTransferService.cs — the single public entry point -->
 
 ```csharp
-public static class Companies
+// The ONLY public types a consumer of this feature ever sees:
+//   - IMoneyTransferService (this interface)
+//   - TransferResult / TransferSummaryDto (return DTOs)
+//   - TransferRequestDto (input DTO)
+// Everything else — Transfer, Money, AccountId, TransferOptions, DbContext config — is internal.
+public interface IMoneyTransferService
 {
-    // Preferred teaching style: inject DbContext directly
-    public static async Task<IResult> GetAllAsync(AppDbContext db) =>
-        Results.Ok(await db.Companies.AsNoTracking()
-            .Select(c => new CompanyResponseDto(c.Handle, c.Name, c.IncorporatedIn.Code, c.IncorporatedIn.Name))
-            .ToListAsync());
+    Task<TransferResult?> RequestTransferAsync(
+        TransferRequestDto request, CancellationToken ct = default);
+    Task<IReadOnlyList<TransferSummaryDto>> GetPendingAsync(
+        AccountIdDto account, CancellationToken ct = default);
+}
+```
 
-    public static async Task<IResult> PostAsync(AppDbContext db, NewCompanyRequestDto request)
+<!-- File: FeatureLibraries/Transfers/TransferService.cs — internal implementation -->
+
+```csharp
+internal sealed class TransferService(
+    AppDbContext db,
+    IOptions<TransferOptions> options) : IMoneyTransferService
+{
+    public async Task<TransferResult?> RequestTransferAsync(
+        TransferRequestDto request, CancellationToken ct)
     {
-        var errors = new List<string>();
-        if (string.IsNullOrWhiteSpace(request.Name)) errors.Add(nameof(request.Name));
-        if (errors.Count > 0) return Results.BadRequest(new { Errors = errors });
+        // Validate at the public boundary — convert DTOs to domain types
+        var from = AccountId.TryCreate(request.FromAccountId);
+        var to = AccountId.TryCreate(request.ToAccountId);
+        var amount = Money.TryCreate(request.Amount, request.CurrencyCode);
 
-        var company = Company.TryCreateNew(request.Handle ?? Guid.NewGuid().ToString(), request.Name);
-        if (company is null) return Results.BadRequest("Invalid company data.");
+        if (from is null || to is null || amount is null)
+            return null;   // Soft failure — caller decides how to present the error
 
-        db.Companies.Add(company);
-        await db.SaveChangesAsync();
-        return Results.Ok(company.ToResponseDto());
+        var transfer = Transfer.TryCreateNew(from, to, amount, options.Value.MaxTransferAmount);
+        if (transfer is null) return null;
+
+        db.Transfers.Add(transfer);
+        await db.SaveChangesAsync(ct);
+        return TransferResult.FromTransfer(transfer);
+    }
+    // ...
+}
+```
+
+<!-- File: FeatureLibraries/Transfers/ServiceCollectionExtensions.cs — one-call registration -->
+
+```csharp
+namespace Microsoft.Extensions.DependencyInjection;
+
+public static class TransferServiceCollectionExtensions
+{
+    public static IServiceCollection AddTransfers(
+        this IServiceCollection services,
+        IConfiguration configuration)
+    {
+        services.Configure<TransferOptions>(
+            configuration.GetSection("Transfers"));
+        services.AddScoped<IMoneyTransferService, TransferService>();
+        services.AddDbContext<AppDbContext>(options =>
+            options.UseSqlServer(configuration.GetConnectionString("TransfersDb")));
+        return services;
     }
 }
 ```
 
-<!-- File: code-openapi-docs/.../Program.cs — route registration -->
+<!-- File: FeatureLibraries/Transfers/TransferOptions.cs — self-documenting configuration -->
 
 ```csharp
-app.MapGet("/api/companies", Companies.GetAllAsync);
-app.MapPost("/api/companies", Companies.PostAsync)
-    .Produces<BadRequestDetails>(StatusCodes.Status400BadRequest);
-app.MapGet("/api/companies/{handle}", Companies.GetSingleAsync);
-app.MapPut("/api/companies/{handle}", Companies.UpdateAsync);
+public record TransferOptions
+{
+    public static TransferOptions Default => new();
+
+    public decimal MaxTransferAmount { get; init; } = 1_000_000m;
+    public int TransferExpiryHours { get; init; } = 24;
+}
 ```
 
-<!-- File: code-openapi-docs/.../Api/Responses/Problem.cs — typed error responses -->
+<!-- File: Consumer/Program.cs — integrating the feature, with optional HTTP exposure -->
 
 ```csharp
-public static class Problem
+// Consumer adds the entire feature with one line
+builder.Services.AddTransfers(builder.Configuration);
+
+// The feature's public API is IMoneyTransferService — usable from anywhere:
+// a background job, a console command, a gRPC handler, or an HTTP endpoint.
+// Exposing it via HTTP is an orthogonal decision, not the feature's concern.
+app.MapPost("/transfers", async (
+    TransferRequestDto request, IMoneyTransferService transfers) =>
 {
-    public static ProblemHttpResult CompanyNotFound() => TypedResults.Problem(
-        statusCode: (int)HttpStatusCode.NotFound, detail: "Company not found.");
-
-    public static ProblemHttpResult InvalidRequestFields(IEnumerable<string> invalidFields) =>
-        BadRequestDetails.CreateInvalidFields(invalidFields);
-
-    public static ProblemHttpResult BadRequest(string detail) =>
-        BadRequestDetails.Create(detail);
-}
+    var result = await transfers.RequestTransferAsync(request);
+    return result is null
+        ? Results.BadRequest("Invalid transfer.")
+        : Results.Ok(result);
+});
 ```
 
 ---
@@ -749,13 +798,13 @@ modelBuilder.Entity<Invoice>(entity =>
 
 ## Decision Point 9: Persisting Domain Objects (Simplified)
 
-Domain objects are persisted through a single, straightforward `DbContext` class — no repository abstractions, no unit-of-work interfaces, no partial class files per aggregate. API endpoints inject the `DbContext` directly and call its `DbSet<T>` properties. Queries always use the domain key (the alternate key or unique index), never the shadow primary key. Reads use `AsNoTracking()` to avoid change-tracker overhead; writes use the default tracking behavior and call `SaveChangesAsync()` to persist.
+Domain objects are persisted through a single, straightforward `DbContext` class — no repository abstractions, no unit-of-work interfaces, no partial class files per aggregate. Consumers inject the `DbContext` directly and call its `DbSet<T>` properties. Queries always use the domain key (the alternate key or unique index), never the shadow primary key. Reads use `AsNoTracking()` to avoid change-tracker overhead; writes use the default tracking behavior and call `SaveChangesAsync()` to persist.
 
 *Note: Zoran's actual codebase also demonstrates an advanced DDD variant using `IRepository<TAggregate,TKey>`, `IUnitOfWork`, and partial `DbContext` classes — see `code-ef-core-ddd-abstractions/` and `code-ef-core-ddd-patterns/`. For teaching purposes, prefer the simplified direct-DbContext approach below.*
 
 ### MUST
 - Query exclusively by the domain key via LINQ — `db.Companies.FirstOrDefaultAsync(c => c.PublicId == id)`. Never call `DbSet<T>.Find(key)`. **Rationale**: `Find()` operates on the shadow primary key known only to EF Core, bypassing the domain's identity boundary entirely.
-- Inject the `DbContext` directly into API endpoint methods — `PostAsync(AppDbContext db, NewRequestDto request)`. **Rationale**: One injection covers all entity types; no repository-per-aggregate boilerplate.
+- Inject the `DbContext` directly into consuming classes — `PostAsync(AppDbContext db, NewRequestDto request)`. **Rationale**: One injection covers all entity types; no repository-per-aggregate boilerplate.
 - Query domain-typed properties through their `ComplexProperty`-mapped navigation paths — `db.Transfers.Where(t => t.Amount.Currency.Code == "USD")`. **Rationale**: `ComplexProperty` translates deeply nested LINQ expressions to flat SQL columns — use it.
 
 ### SHOULD
@@ -764,26 +813,26 @@ Domain objects are persisted through a single, straightforward `DbContext` class
 - Place entity configuration in `Data/EntityConfiguration/` — one `IEntityTypeConfiguration<T>` file per entity, applied via `modelBuilder.ApplyConfiguration()` in `OnModelCreating()`. **Rationale**: Keeps mapping logic separate from the `DbContext` and the domain model, so neither knows about the other.
 
 ### MAY
-- For large projects with many endpoints, extract complex read queries into dedicated query classes in `Data/Queries/` that take `DbContext` as a dependency. **Rationale**: Prevents the `DbContext` class itself from accumulating query logic.
+- For large projects with many query paths, extract complex read queries into dedicated query classes in `Data/Queries/` that take `DbContext` as a dependency. **Rationale**: Prevents the `DbContext` class itself from accumulating query logic.
 
 ---
 
 ## Decision Point 10: Writing a Test
 
-Every test is an end-to-end integration test running against a real SQL Server database — no mocking, no in-memory providers. Tests exercise the full HTTP stack through `WebApplicationFactory<Program>`, verifying real API contracts, real persistence, and real validation rules. Writing a test means naming it after the scenario it proves, wiring it to a collection fixture that drops and recreates the database, and asserting with only xUnit primitives.
+Every test is an end-to-end integration test running against a real SQL Server database — no mocking, no in-memory providers. For feature libraries, tests exercise the public interface (`IMoneyTransferService`) directly, resolving dependencies through the same DI container the application uses — the test is the first real consumer. For web API projects, tests exercise the full HTTP stack through `WebApplicationFactory<Program>`. Writing a test means naming it after the scenario it proves, wiring it to a fixture that drops and recreates the database, and asserting with only MSTest primitives.
 
 ### MUST
 - Name test methods as `{Scenario}_{Condition}_{ExpectedResult}` — e.g., `CreateCompany_WithValidRequest_ReturnsCreatedCompany`. **Rationale**: The method signature is the test specification; reading the name tells you what is proven and under what conditions.
-- Use ONLY xUnit assertion primitives: `Assert.Equal`, `Assert.NotNull`, `Assert.NotEqual`, `Assert.Contains`, `Assert.Single`, `Assert.All`, `Assert.NotEmpty`, `Assert.DoesNotContain`. **Rationale**: Every assertion library beyond xUnit's built-in primitives adds a dependency that obscures failures with non-standard output.
-- Reference the NuGet packages `xunit` (2.9.x), `xunit.runner.visualstudio`, and `Microsoft.NET.Test.Sdk` — nothing else. **Rationale**: A minimal test dependency surface prevents version conflicts and keeps test infrastructure auditable.
-- Write zero mocks or stubs — every test exercises the real database and real HTTP pipeline through `WebApplicationFactory`. **Rationale**: Mocked tests prove the mock works; integration tests prove the system works.
-- Attach `[Collection]` to every test class referencing a collection definition that sets `DisableParallelization = true`. **Rationale**: A single database instance shared across parallel test runs produces nondeterministic failures.
+- Use ONLY MSTest assertion primitives: `Assert.AreEqual`, `Assert.IsNotNull`, `Assert.AreNotEqual`, `CollectionAssert.Contains`, `Assert.AreEqual(1, collection.Count())`, `Assert.IsTrue(collection.All(...))`, `Assert.IsTrue(collection.Any())`, `CollectionAssert.DoesNotContain`. Use `Assert.Throws<T>` (or `Assert.ThrowsExactly<T>`) for expected exceptions — never `[ExpectedException]`. **Rationale**: Every assertion library beyond MSTest's built-in primitives adds a dependency that obscures failures with non-standard output. The deprecated `Assert.ThrowsException` and `ExpectedExceptionAttribute` are removed in MSTest v4.
+- Reference the `MSTest.Sdk` (4.2.x) in the test project — use `<Project Sdk="MSTest.Sdk/4.2.3">` in the `.csproj` to pull in `MSTest.TestFramework`, `MSTest.TestAdapter`, and `MSTest.Analyzers` automatically. For VSTest compatibility, also add `<PackageReference Include="Microsoft.NET.Test.Sdk" />`. **Rationale**: MSTest.Sdk eliminates the ceremony of individual package references; one SDK reference covers the entire test infrastructure.
+- Write zero mocks or stubs — every test exercises the real database and real feature code. For feature libraries, resolve the public interface from the DI container; for web APIs, exercise through `WebApplicationFactory`. **Rationale**: Mocked tests prove the mock works; integration tests prove the system works.
+- Mark each test class with `[TestClass]` and either `[DoNotParallelize]` on the class or `[assembly: DoNotParallelize]` to serialize database access. **Rationale**: A single database instance shared across parallel test runs produces nondeterministic failures.
 
 ### SHOULD
-- Implement `IAsyncLifetime` on the fixture class, dropping and recreating the database in `InitializeAsync`. **Rationale**: A fresh database per test run guarantees no test order dependency and no leftover state.
+- Use `[ClassInitialize]` (or `[AssemblyInitialize]`) to drop and recreate the database once per test run. Use `[TestInitialize]` for per-test setup like creating a fresh `HttpClient`. In MSTest v4, `[ClassCleanup]` always runs at end-of-class (the `ClassCleanupBehavior` enum was removed). **Rationale**: A fresh database per test run guarantees no test order dependency and no leftover state.
 - Subclass `WebApplicationFactory<Program>` and override `ConfigureWebHost` to call `builder.UseEnvironment("E2ETests")`. **Rationale**: Environment-specific configuration prevents tests from touching production resources.
-- Place `[Fact]` and `[Theory]` methods in an abstract test class receiving `HttpClient` via primary constructor, then create a one-line concrete class that inherits from it and wires the fixture's `HttpClient`. **Rationale**: Separating test logic from infrastructure binding keeps tests portable across fixture implementations.
-- Use `[Theory]` with `[InlineData]` for boundary testing — one `[InlineData]` row per invalid input variant. **Rationale**: Each row is a self-contained proof that a specific invalid value is rejected.
+- Place `[TestMethod]` and `[DataTestMethod]` methods in an abstract test class receiving `HttpClient` via primary constructor, then create a one-line concrete class that inherits from it and wires the fixture's `HttpClient`. **Rationale**: Separating test logic from infrastructure binding keeps tests portable across fixture implementations.
+- Use `[DataTestMethod]` with `[DataRow]` for boundary testing — one `[DataRow]` row per invalid input variant. **Rationale**: Each row is a self-contained proof that a specific invalid value is rejected.
 - Define private `record` types at the bottom of the test file for request and response DTOs. **Rationale**: File-local records keep test data contracts visible without polluting the project namespace.
 - Use primary constructor injection for fixtures: `public class MyTests(WebApiTestsFixture fixture) : MyAbstractTests(fixture.Client)`. **Rationale**: Primary constructors eliminate boilerplate field declarations and redundant assignment.
 
@@ -796,37 +845,57 @@ Every test is an end-to-end integration test running against a real SQL Server d
 
 ```csharp
 using System.Net.Http.Json;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
 
 namespace EndToEndTests.Companies;
 
-public abstract class CreateCompanyTests(HttpClient client)
+[TestClass]
+[DoNotParallelize]
+public abstract class CreateCompanyTests
 {
-    private HttpClient Client { get; } = client;
+    private static WebApplicationFactory<Program> _factory = null!;
+    private HttpClient? _client;
 
-    [Fact]
+    [ClassInitialize(InheritanceBehavior.BeforeEachDerivedClass)]
+    public static async Task ClassInitialize(TestContext context)
+    {
+        _factory = new WebApplicationFactory<Program>()
+            .WithWebHostBuilder(b => b.UseEnvironment("E2ETests"));
+        await DatabaseFixture.ResetAsync();
+    }
+
+    [TestInitialize]
+    public void TestInitialize()
+    {
+        _client = _factory.CreateClient();
+    }
+
+    protected HttpClient Client => _client!;
+
+    [TestMethod]
     public async Task CreateCompany_WithValidRequest_ReturnsCreatedCompany()
     {
         var request = new NewCompanyRequest("Test Company", "USA");
         var createdCompany = await CreateCompanyAsync(Client, request);
 
-        Assert.NotEqual(Guid.Empty.ToString(), createdCompany.Handle);
-        Assert.Equal(request.Name, createdCompany.Name);
-        Assert.Equal(request.IncorporatedInCode, createdCompany.IncorporatedInCode);
+        Assert.AreNotEqual(Guid.Empty.ToString(), createdCompany.Handle);
+        Assert.AreEqual(request.Name, createdCompany.Name);
+        Assert.AreEqual(request.IncorporatedInCode, createdCompany.IncorporatedInCode);
     }
 
-    [Theory]
-    [InlineData("", "USA")]
-    [InlineData("Valid Name", "")]
-    [InlineData("   ", "USA")]
-    [InlineData("Valid Name", "   ")]
-    [InlineData("Valid Name", "SOMETHING")]
+    [DataTestMethod]
+    [DataRow("", "USA")]
+    [DataRow("Valid Name", "")]
+    [DataRow("   ", "USA")]
+    [DataRow("Valid Name", "   ")]
+    [DataRow("Valid Name", "SOMETHING")]
     public async Task CreateCompany_WithInvalidCompanyName_ReturnsBadRequest(
         string name, string countryCode)
     {
         var request = new NewCompanyRequest(name, countryCode);
         var response = await Client.PostAsJsonAsync("/api/companies", request);
 
-        Assert.Equal(System.Net.HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.AreEqual(System.Net.HttpStatusCode.BadRequest, response.StatusCode);
     }
 
     public static async Task<CompanyResponse> CreateCompanyAsync(
@@ -867,7 +936,7 @@ Zoran keeps every layer in its own type — domain models, database rows, query 
 - SHOULD name conversion methods `ToModel()`, `ToResponseDto()`, or `ToSummaryDto()` — never `Map()` or `Convert()`. **Rationale**: Verbose, type-naming method names make it obvious at the call site exactly which target type the conversion produces.
 
 ### MAY
-- MAY colocate the inline request record at the bottom of `Program.cs` when the request type exists only for that single endpoint. **Rationale**: Inline request records avoid polluting the project with one-line DTO files while keeping the binding type adjacent to its consuming endpoint.
+- MAY colocate the inline request DTO at the bottom of the feature's public interface file when the request type exists only for that single method. **Rationale**: Inline request records avoid polluting the project with one-line DTO files while keeping the binding type adjacent to its consuming method.
 
 <!-- File: code-record-types-validation/.../DataModels/PersonRow.cs -->
 
@@ -1036,12 +1105,13 @@ public class Invoice(
 
 ## Decision Point 14: Setting Up DI / Project Wiring
 
-DI follows a minimal recipe: register the `DbContext` and nothing else for data access. API endpoint methods receive the `DbContext` directly as a parameter — no repository interfaces, no service locator, no extra abstraction layers. The container never calls back into itself — there is no `IServiceProvider` argument and no `GetService<T>()` outside `Program.cs`.
+DI follows a minimal recipe: register the `DbContext` and nothing else for data access. Feature classes receive the `DbContext` directly as a parameter — no repository interfaces, no service locator, no extra abstraction layers. The container never calls back into itself — there is no `IServiceProvider` argument and no `GetService<T>()` outside the composition root.
 
 ### MUST
 - Register EF Core `DbContext` with `AddDbContext<T>()` and a connection-string-derived options callback. **Rationale**: `AddDbContext` configures the scoped lifetime, pooled factory, and disposal orchestration.
 - Enable `Nullable` and `ImplicitUsings` in every `.csproj`. **Rationale**: Nullable guards force explicit null-handling decisions; implicit usings eliminate boilerplate `using` lines for `System`, `System.Linq`, etc.
-- Use only parameter injection in endpoint methods — never pass `IServiceProvider` into a class. **Rationale**: Parameter injection makes dependencies explicit in the method signature; service location hides them.
+- Use only parameter injection in consuming classes — never pass `IServiceProvider` into a class. **Rationale**: Parameter injection makes dependencies explicit in the method signature; service location hides them.
+- Use `System.Text.Json` exclusively for all JSON serialization — never use `Newtonsoft.Json`
 
 ### SHOULD
 - Use primary constructors for DI-injected classes whose parameters map directly to stored fields. **Rationale**: Removes the ceremony of private readonly field declarations and assignment-only constructor bodies.
@@ -1102,7 +1172,7 @@ These patterns explicitly violate Zoran's conventions. If you generate any of th
 | `[Required] public string Name` on a domain model | `{ get; init; }` with ternary + throw validation |
 | `[Key]` or `[Column]` attributes on domain classes | Fluent API `IEntityTypeConfiguration<T>` in `Data/EntityConfiguration/` |
 | `DbSet<T>.Find(id)` | `FirstOrDefaultAsync(e => e.PublicId == domainKey)` |
-| Wrapping `DbContext` in `IRepository<TAggregate, TKey>` | Inject `DbContext` directly into endpoint methods |
+| Wrapping `DbContext` in `IRepository<TAggregate, TKey>` | Inject `DbContext` directly into consuming classes |
 | `OwnsOne` / `OwnsMany` for value objects | `ComplexProperty` (EF Core 8+) — flattens into owning table, no JOINs |
 | Forgetting parameterless constructor on value objects used in `ComplexProperty` | Add `private Money() : this(default, default!) { }` — required for EF Core materialization |
 | `ControllerBase` subclass | `public static class Xxx { ... }` with static Minimal API methods |
@@ -1112,7 +1182,8 @@ These patterns explicitly violate Zoran's conventions. If you generate any of th
 | `Utils.cs`, `Helpers.cs`, `Constants.cs`, `Enums.cs` | One concept, one file. Even a single `enum` gets its own file. |
 | `public` constructor on a domain entity | `internal` constructor + `static class XxxConstruction` with `extension(Xxx)` factories |
 | `bool IsValid { get; }` or `void Validate()` | Validation in `{ get; init; }` at construction time — invalid objects never exist |
-| FluentAssertions / Shouldly / Moq / NSubstitute | Raw xUnit `Assert.*` only. Zero mocking. |
+| FluentAssertions / Shouldly / Moq / NSubstitute | Raw MSTest `Assert.*` only. Zero mocking. |
+| `Newtonsoft.Json` / `JsonConvert` | `System.Text.Json` — built into .NET, zero dependencies. |
 | `string` for identifiers (`string handle`, `string currencyCode`) | Dedicated type: `CompanyHandle`, `Currency`, `Iso4217Currency` |
 | Shadow PK named `"Id"` when domain model already has an `Id` property | Rename shadow PK to `"Key"` with `HasColumnName("Id")` |
 | `DateTimeKind` stripped silently by SQL Server | Reapply `DateTime.SpecifyKind(dt, DateTimeKind.Utc)` in value converter |
