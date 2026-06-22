@@ -44,7 +44,7 @@ Value objects wrap primitive types in domain-meaningful types that enforce invar
 - MUST include `nameof()` in every `ArgumentException` call that refers to a parameter name. **Rationale**: Eliminates magic strings that silently rot under rename refactoring.
 
 ### SHOULD
-- SHOULD provide a static `NewId()` factory method for ID value objects that wraps `Guid.NewGuid()`. **Rationale**: Centralizes GUID generation, hides the constructor from casual callers, and makes the intent explicit at the call site.
+- SHOULD provide a static `NewId()` factory method for ID value objects that wraps `Guid.NewGuid()`. **Rationale**: Centralizes GUID generation; makes intent explicit at the call site.
 - SHOULD provide a well-known `Empty` sentinel property for ID types that wraps `Guid.Empty`. **Rationale**: Eliminates null checks and provides an explicit, searchable "no value" representation.
 - SHOULD include more than a single field in value objects when additional data naturally clusters with the core value (e.g., `Iso4217Currency` in `Money`). **Rationale**: Co-locating related data prevents primitive obsession and enables domain arithmetic without back-referencing external data.
 - SHOULD bundle domain rules into the value object itself — not in a separate service. Example: `Currency` carries `DecimalPlaces` so `Money` can auto-round without consulting an external configuration. **Rationale**: The value object becomes both identity and policy carrier; callers never need to know which currency has which precision.
@@ -458,10 +458,10 @@ static class NullableMonad
 
 ## Decision Point 6: Designing a Feature Library's Public API
 
-A feature ships as a self-contained class library whose "API" is the set of public interfaces and extension methods a consumer sees — not HTTP routes. Every domain model, value object, entity, EF Core configuration class, and internal service is `internal`. The consumer adds the feature with a single `services.AddFeatureXxx()` call and interacts through one or two public interfaces. That is the entire integration surface.
+A feature ships as a self-contained class library whose "API" is the set of public interfaces and extension methods a consumer sees — not HTTP routes. Every domain model, entity, value object, EF Core configuration class, and internal service is `internal`. The consumer adds the feature with a single `services.AddFeatureXxx()` call and interacts through one or two public interfaces.
 
 ### MUST
-- MUST expose exactly one or two `public interface` types as the consumer's sole entry point to the feature. Example: `IMoneyTransferService`, `IInvoiceGenerator`. **Rationale**: A single entry-point interface tells the consumer "here is everything this feature can do" without forcing them to discover multiple scattered types. Two interfaces is acceptable when read and write paths have meaningfully different contracts.
+- MUST expose exactly one or two `public interface` types as the consumer's sole entry point to the feature. Example: `IMoneyTransferService`, `IInvoiceGenerator`. **Rationale**: One interface tells the consumer everything the feature can do. Two when read and write paths have meaningfully different contracts.
 - MUST keep domain models, entities, value objects, EF Core configuration, and internal services as `internal`. **Rationale**: The domain is the feature's private implementation. Exposing an `AccountId` or `Money` type to consumers couples them to internal representations; changes to domain types should never break consumers.
 - MUST provide an `IServiceCollection` extension method that registers the entire feature in one call: `services.AddTransfers(configuration)`. **Rationale**: A single registration call replaces the consumer's need to understand the feature's internal dependency graph — one `AddXxx()` and the feature is wired.
 - MUST return DTOs and result records from public interface methods — never domain entities or value objects. **Rationale**: DTOs form an explicit, versionable contract between the feature and its consumers. Returning a domain object leaks the internal model and breaks consumers when the model evolves.
@@ -609,7 +609,7 @@ Zoran's project organization enforces a strict one-to-one mapping from filesyste
 
 ## Decision Point 8: Configuring EF Core (DbContext + Entity Config)
 
-EF Core configuration is where the domain model meets the database. Zoran's approach enforces a strict separation: the domain model must know nothing about persistence, and the configuration layer bears sole responsibility for mapping domain types to relational schema. Every choice — shadow keys, alternate keys, ComplexProperty, value converters — serves the goal of keeping the domain model pure while giving EF Core exactly what it needs to generate clean, navigable SQL.
+Zoran's approach enforces strict separation: the domain model must know nothing about persistence; the configuration layer bears sole responsibility for mapping domain types to relational schema. Every choice — shadow keys, alternate keys, ComplexProperty, value converters — serves the goal of keeping the domain model pure while giving EF Core exactly what it needs to generate clean, navigable SQL.
 
 ### MUST
 
@@ -628,7 +628,7 @@ EF Core configuration is where the domain model meets the database. Zoran's appr
       .ValueGeneratedOnAdd();
   builder.HasKey("Key");
   ```
-  **Rationale**: EF Core cannot have a shadow property and a CLR property with the same name on the same entity. Rename the shadow property to `"Key"` (or any non-colliding name) and use `HasColumnName("Id")` to keep the database convention.
+  **Rationale**: EF Core cannot have a shadow property and a CLR property with the same name. Rename it and use `HasColumnName` to preserve the database convention.
 
 - Expose the domain identity as an alternate key or unique index, never making it the primary key. **Rationale**: Alternate keys enable query-by-domain-id on indexed columns while foreign keys reference the surrogate integer, so domain IDs remain opaque to table relationships.
 
@@ -798,7 +798,7 @@ modelBuilder.Entity<Invoice>(entity =>
 
 ## Decision Point 9: Persisting Domain Objects (Simplified)
 
-Domain objects are persisted through a single, straightforward `DbContext` class — no repository abstractions, no unit-of-work interfaces, no partial class files per aggregate. Consumers inject the `DbContext` directly and call its `DbSet<T>` properties. Queries always use the domain key (the alternate key or unique index), never the shadow primary key. Reads use `AsNoTracking()` to avoid change-tracker overhead; writes use the default tracking behavior and call `SaveChangesAsync()` to persist.
+Consumers inject a single `DbContext` directly — no repository abstractions, no unit-of-work interfaces, no partial class files per aggregate. Queries always use the domain key (the alternate key or unique index), never the shadow primary key. Reads use `AsNoTracking()` to avoid change-tracker overhead; writes use the default tracking behavior and call `SaveChangesAsync()` to persist.
 
 *Note: Zoran's actual codebase also demonstrates an advanced DDD variant using `IRepository<TAggregate,TKey>`, `IUnitOfWork`, and partial `DbContext` classes — see `code-ef-core-ddd-abstractions/` and `code-ef-core-ddd-patterns/`. For teaching purposes, prefer the simplified direct-DbContext approach below.*
 
@@ -819,11 +819,13 @@ Domain objects are persisted through a single, straightforward `DbContext` class
 
 ## Decision Point 10: Writing a Test
 
-Every test is an end-to-end integration test running against a real SQL Server database — no mocking, no in-memory providers. For feature libraries, tests exercise the public interface (`IMoneyTransferService`) directly, resolving dependencies through the same DI container the application uses — the test is the first real consumer. For web API projects, tests exercise the full HTTP stack through `WebApplicationFactory<Program>`. Writing a test means naming it after the scenario it proves, wiring it to a fixture that drops and recreates the database, and asserting with only MSTest primitives.
+Every test is an end-to-end integration test running against a real SQL Server database — no mocking, no in-memory providers. For feature libraries, tests exercise the public interface (`IMoneyTransferService`) directly, resolving dependencies through the same DI container the application uses — the test is the first real consumer. For web API projects, tests exercise the full HTTP stack through `WebApplicationFactory<Program>`.
 
 ### MUST
 - Name test methods as `{Scenario}_{Condition}_{ExpectedResult}` — e.g., `CreateCompany_WithValidRequest_ReturnsCreatedCompany`. **Rationale**: The method signature is the test specification; reading the name tells you what is proven and under what conditions.
-- Use ONLY MSTest assertion primitives: `Assert.AreEqual`, `Assert.IsNotNull`, `Assert.AreNotEqual`, `CollectionAssert.Contains`, `Assert.AreEqual(1, collection.Count())`, `Assert.IsTrue(collection.All(...))`, `Assert.IsTrue(collection.Any())`, `CollectionAssert.DoesNotContain`. Use `Assert.Throws<T>` (or `Assert.ThrowsExactly<T>`) for expected exceptions — never `[ExpectedException]`. **Rationale**: Every assertion library beyond MSTest's built-in primitives adds a dependency that obscures failures with non-standard output. The deprecated `Assert.ThrowsException` and `ExpectedExceptionAttribute` are removed in MSTest v4.
+- Use ONLY MSTest assertion primitives. **Rationale**: Every assertion library beyond MSTest's built-in primitives adds a dependency that obscures failures with non-standard output.
+
+  **Allowed primitives**: `Assert.AreEqual`, `Assert.IsNotNull`, `Assert.AreNotEqual`, `CollectionAssert.Contains`, `Assert.AreEqual(1, collection.Count())`, `Assert.IsTrue(collection.All(...))`, `Assert.IsTrue(collection.Any())`, `CollectionAssert.DoesNotContain`. For expected exceptions use `Assert.Throws<T>` or `Assert.ThrowsExactly<T>` — never `[ExpectedException]` (removed in MSTest v4), never the deprecated `Assert.ThrowsException`.
 - Reference the `MSTest.Sdk` (4.2.x) in the test project — use `<Project Sdk="MSTest.Sdk/4.2.3">` in the `.csproj` to pull in `MSTest.TestFramework`, `MSTest.TestAdapter`, and `MSTest.Analyzers` automatically. For VSTest compatibility, also add `<PackageReference Include="Microsoft.NET.Test.Sdk" />`. **Rationale**: MSTest.Sdk eliminates the ceremony of individual package references; one SDK reference covers the entire test infrastructure.
 - Write zero mocks or stubs — every test exercises the real database and real feature code. For feature libraries, resolve the public interface from the DI container; for web APIs, exercise through `WebApplicationFactory`. **Rationale**: Mocked tests prove the mock works; integration tests prove the system works.
 - Mark each test class with `[TestClass]` and either `[DoNotParallelize]` on the class or `[assembly: DoNotParallelize]` to serialize database access. **Rationale**: A single database instance shared across parallel test runs produces nondeterministic failures.
@@ -1111,7 +1113,7 @@ DI follows a minimal recipe: register the `DbContext` and nothing else for data 
 - Register EF Core `DbContext` with `AddDbContext<T>()` and a connection-string-derived options callback. **Rationale**: `AddDbContext` configures the scoped lifetime, pooled factory, and disposal orchestration.
 - Enable `Nullable` and `ImplicitUsings` in every `.csproj`. **Rationale**: Nullable guards force explicit null-handling decisions; implicit usings eliminate boilerplate `using` lines for `System`, `System.Linq`, etc.
 - Use only parameter injection in consuming classes — never pass `IServiceProvider` into a class. **Rationale**: Parameter injection makes dependencies explicit in the method signature; service location hides them.
-- Use `System.Text.Json` exclusively for all JSON serialization — never use `Newtonsoft.Json`
+- Use `System.Text.Json` exclusively for all JSON serialization — never add a `Newtonsoft.Json` package reference or use `JsonConvert`. **Rationale**: `System.Text.Json` is built into .NET, requires zero external dependencies, and has been the standard since .NET Core 3.0.
 
 ### SHOULD
 - Use primary constructors for DI-injected classes whose parameters map directly to stored fields. **Rationale**: Removes the ceremony of private readonly field declarations and assignment-only constructor bodies.
