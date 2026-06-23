@@ -34,9 +34,11 @@ No `Utils.cs`, no `Helpers.cs`, no `Constants.cs`, no `Enums.cs`. Every concept 
 
 ---
 
+> **Companion types**: Many code examples reference types (`Currency`, `InvoiceStatus`, `InvoiceNumber`, `Money`, `EmployeeId`, `TransferTimestamp`, `AirExchange`, `Temperature`, `Sensors`, `AppDbContext`, `TransferResult`, `TransferRequestDto`, `TransferSummaryDto`, `AccountIdDto`, `Passed<T,TProblem>`, `Failed<T,TProblem>`, `IncompleteApproval`, `ApprovedTransfer`, `ICompletedApproval`, `IIncompleteApproval`) that are not defined in this file. These are companion types assumed to exist per the patterns demonstrated in their respective decision points. When generating code, create these types following the same conventions shown here.
+
 ## Decision Point 1: Creating a Value Object
 
-Value objects wrap primitive types in domain-meaningful types that enforce invariants at construction, making invalid states unrepresentable. Use C# records for structural equality semantics; use `{ get; init; }` with ternary + throw in the property initializer so validation fires before the object materializes. Static factory methods provide well-known instances (`Empty`, `UtcNow`, `NewId()`) while keeping the primary constructor public for deserialization. Never add implicit conversion operators — they hide allocation and bypass validation.
+Value objects wrap primitive types in domain-meaningful types that enforce invariants at construction, making invalid states unrepresentable. Use C# records for structural equality semantics; use `{ get; init; }` with ternary + throw in the property initializer so validation fires before the object materializes. Static factory methods provide well-known instances (`Empty`, `UtcNow`, `NewId()`) while keeping the primary constructor internal for deserialization. Never add implicit conversion operators — they hide allocation and bypass validation.
 
 ### MUST
 - MUST declare value objects as `internal record` with a primary constructor wrapping the underlying primitive. **Rationale**: Records deliver structural equality and `{ get; init; }` value semantics out of the box. Value objects are internal to their feature library (see Decision Point 6); value objects shared across multiple features belong in a shared kernel assembly where they may be `public record`.
@@ -47,7 +49,7 @@ Value objects wrap primitive types in domain-meaningful types that enforce invar
 - SHOULD provide a static `NewId()` factory method for ID value objects that wraps `Guid.NewGuid()`. **Rationale**: Centralizes GUID generation; makes intent explicit at the call site.
 - SHOULD provide a well-known `Empty` sentinel property for ID types that wraps `Guid.Empty`. **Rationale**: Eliminates null checks and provides an explicit, searchable "no value" representation.
 - SHOULD include more than a single field in value objects when additional data naturally clusters with the core value (e.g., `Iso4217Currency` in `Money`). **Rationale**: Co-locating related data prevents primitive obsession and enables domain arithmetic without back-referencing external data.
-- SHOULD bundle domain rules into the value object itself — not in a separate service. Example: `Currency` carries `DecimalPlaces` so `Money` can auto-round without consulting an external configuration. **Rationale**: The value object becomes both identity and policy carrier; callers never need to know which currency has which precision.
+- SHOULD bundle domain rules into the value object itself — not in a separate service. Example: `Currency` carries `DecimalPlaces` (called `MinorUnit` in ISO 4217) so `Money` can auto-round without consulting an external configuration. **Rationale**: The value object becomes both identity and policy carrier; callers never need to know which currency has which precision.
 
 ### MAY
 - MAY override `ToString()` for human-readable display of truncated identifiers. **Rationale**: Improves log and debug readability without exposing internal structure.
@@ -77,6 +79,9 @@ internal record AccountId(Guid Id)
     public Guid Id { get; init; } =
         Id != Guid.Empty ? Id
         : throw new ArgumentException("Account ID must be a non-empty GUID.", nameof(Id));
+
+    public static AccountId? TryCreate(Guid? id) =>
+        id is Guid g && g != Guid.Empty ? new AccountId(g) : null;
 }
 ```
 
@@ -122,7 +127,7 @@ Aggregates enforce consistency boundaries through controlled mutation paths. Con
 <!-- File: code-record-types-validation/.../Person.cs -->
 
 ```csharp
-public record class Person
+internal record class Person
 {
     internal Person(Guid publicId, string firstName, string lastName) =>
         (PublicId, FirstName, LastName) = (publicId, firstName, lastName);
@@ -152,7 +157,7 @@ public static class PersonConstruction
 <!-- File: code-ef-core-natural-keys/.../Invoice.cs — InEditable guard pattern -->
 
 ```csharp
-public class Invoice internal (
+internal class Invoice(
     InvoiceNumber number, string customerName, DateOnly invoicedOn,
     InvoiceStatus status, Currency currency)
 {
@@ -173,7 +178,7 @@ public class Invoice internal (
 <!-- File: code-ef-core-ddd-patterns/.../Invoice.cs -->
 
 ```csharp
-public class Invoice
+internal class Invoice
 {
     public readonly record struct InvoiceId(Guid Value)
     {
@@ -183,7 +188,7 @@ public class Invoice
 
     public InvoiceId PublicId { get; private set; } = InvoiceId.NewId();
     public string CustomerName { get; private set; } = string.Empty;
-    public decimal Amount { get; private set; }
+    public Money Amount { get; private set; }   // Money (defined elsewhere); Principle 1: no primitive crosses a domain boundary
 
     private List<InvoiceLine> LinesCollection { get; set; } = new List<InvoiceLine>();
     public IEnumerable<InvoiceLine> Lines => LinesCollection.AsReadOnly();
@@ -202,10 +207,10 @@ public class Invoice
 
 ## Decision Point 3: Creating a Discriminated Union (State Machine)
 
-Discriminated unions model mutually exclusive states with exhaustive compile-time checking. Root the hierarchy in `public abstract record BaseType;` and declare each variant as `sealed record Variant(...) : BaseType;`. Interface markers group variants by shared capability (`IApprovable`, `IRejectable`), enabling methods that accept only a subset of states. Use exhaustive switch pattern matching, never if/else chains, so the compiler enforces that every variant is handled.
+Discriminated unions model mutually exclusive states with exhaustive compile-time checking. Root the hierarchy in `internal abstract record BaseType;` and declare each variant as `sealed record Variant(...) : BaseType;`. Interface markers group variants by shared capability (`IApprovable`, `IRejectable`), enabling methods that accept only a subset of states. Use exhaustive switch pattern matching, never if/else chains, so the compiler enforces that every variant is handled.
 
 ### MUST
-- MUST root the union in `public abstract record BaseType;`. **Rationale**: `abstract` prevents direct instantiation of the root, forcing consumers to work with concrete variants.
+- MUST root the union in `internal abstract record BaseType;`. **Rationale**: `abstract` prevents direct instantiation of the root, forcing consumers to work with concrete variants.
 - MUST handle variant dispatch via exhaustive switch pattern matching, never if/else chains. **Rationale**: Pattern-matching switches produce compiler warnings when a variant is not handled; if/else chains silently miss cases.
 
 ### SHOULD
@@ -222,10 +227,10 @@ Discriminated unions model mutually exclusive states with exhaustive compile-tim
 <!-- File: code-cs14-discriminated-unions/.../Estimate.cs -->
 
 ```csharp
-public abstract record Estimate;
-public sealed record Duration(TimeSpan Value) : Estimate;
-public sealed record Interval(TimeSpan Start, TimeSpan Span) : Estimate;
-public sealed record Unknown : Estimate;
+internal abstract record Estimate;
+internal sealed record Duration(TimeSpan Value) : Estimate;
+internal sealed record Interval(TimeSpan Start, TimeSpan Span) : Estimate;
+internal sealed record Unknown : Estimate;
 
 public static class EstimateConstruction
 {
@@ -268,42 +273,42 @@ public static class EstimateComposition
 <!-- File: code-immutable-vs-mutable-persistence/.../FourEyesApproval.cs -->
 
 ```csharp
-public abstract record FourEyesApproval;
+internal abstract record FourEyesApproval;
 
-public interface IApprovable { FourEyesApproval Approve(EmployeeId approver); }
-public interface IRejectable { FourEyesApproval Reject(EmployeeId rejector); }
+internal interface IApprovable { FourEyesApproval Approve(EmployeeId approver); }
+internal interface IRejectable { FourEyesApproval Reject(EmployeeId rejector); }
 
-public record NotRequired : FourEyesApproval;
+internal record NotRequired : FourEyesApproval;
 
-public record PendingApproval : FourEyesApproval, IApprovable, IRejectable
+internal record PendingApproval : FourEyesApproval, IApprovable, IRejectable
 {
     public FourEyesApproval Approve(EmployeeId approver) => new PartlyApproved(approver);
     public FourEyesApproval Reject(EmployeeId rejector) => new Rejected(rejector);
 }
 
-public record PartlyApproved(EmployeeId Approver) : FourEyesApproval, IApprovable, IRejectable
+internal record PartlyApproved(EmployeeId Approver) : FourEyesApproval, IApprovable, IRejectable
 {
     public FourEyesApproval Approve(EmployeeId approver) =>
         approver == Approver ? this : new FullyApproved(Approver, approver);
     public FourEyesApproval Reject(EmployeeId rejector) => new Rejected(rejector);
 }
 
-public record FullyApproved(EmployeeId Approver1, EmployeeId Approver2) : FourEyesApproval, IRejectable
+internal record FullyApproved(EmployeeId Approver1, EmployeeId Approver2) : FourEyesApproval, IRejectable
 {
     public FourEyesApproval Reject(EmployeeId rejector) => new Rejected(rejector);
 }
 
-public record Rejected(EmployeeId Rejector) : FourEyesApproval;
+internal record Rejected(EmployeeId Rejector) : FourEyesApproval;
 ```
 
 <!-- File: code-refactoring-anemic-model/.../Transfer.cs — abstract class state machine with marker interfaces -->
 
 ```csharp
-public abstract class Transfer(
+internal abstract class Transfer(
     Money amount, Guid id, AccountId from, AccountId to,
     TransferTimestamp expiresAt, FourEyesApproval approval) { /* ... */ }
 
-public class PendingTransfer : Transfer
+internal class PendingTransfer : Transfer
 {
     public Transfer AddApproval(EmployeeId approver) =>
         IncompleteApproval.Approve(approver) switch
@@ -386,7 +391,7 @@ static class ComplexDomainDemo
 
 ## Decision Point 5: Handling Validation / Construction Failure
 
-Three distinct failure-handling tiers exist. Hard failures — where input is provably corrupt (e.g., empty GUID, negative amount) — use ternary + throw in property initializers; there is no recovery path. Soft failures — where user input may be invalid — use `TryCreateNew()` returning `T?` (null signals invalid). For multi-step validation chains, the `Checked<T, TProblem>` monad composes checks without short-circuiting exceptions, accumulating problems or unwrapping the final value via `Match()`.
+Three distinct failure-handling tiers exist. Hard failures — where input is provably corrupt (e.g., empty GUID, negative amount) — use ternary + throw in property initializers; there is no recovery path. Soft failures — where user input may be invalid — use `TryCreateNew()` returning `T?` (null signals invalid). For multi-step validation chains where all errors must accumulate rather than short-circuit, the `Checked<T, TProblem>` monad (see MAY below) is available.
 
 ### MUST
 - MUST use ternary + throw in property initializers for invariants that are never expected to fail under correct system operation (e.g., non-empty GUID, non-negative amount). **Rationale**: These are programming errors, not recoverable input errors; the stack trace pinpoints the bug immediately.
@@ -585,12 +590,12 @@ Zoran's project organization enforces a strict one-to-one mapping from filesyste
 
 ### MUST
 - Use file-scoped namespaces exclusively: `namespace X.Y.Z;` with no braces. **Rationale**: Eliminates one level of indentation and the useless closing brace region that IDEs otherwise require.
-- Place exactly one public type per file. **Rationale**: The filename tells you the type; a file named `Company.cs` never surprises with a second exported concept.
+- Place exactly one type per file. **Rationale**: The filename tells you the type; a file named `Company.cs` never surprises with a second exported concept.
 - Match the namespace exactly to the folder path from the project root. **Rationale**: `Models/` → `namespace X.Models;` makes locating any type a mechanical filesystem walk with zero ambiguity.
 - Set `<RootNamespace>` in every `.csproj` so the project file name does not leak into C# namespaces. **Rationale**: Decouples the project file name (which may evolve) from the namespace contract referenced by hundreds of source files.
 
 ### SHOULD
-- Colocate discriminated union variants (the abstract base and all `sealed` subtypes) in a single file. **Rationale**: The variants collectively define one closed type hierarchy; splitting them across files scatters the exhaustive-match guarantee and forces the reader to re-assemble the union mentally.
+- Colocate discriminated union variants in a single file when they are simple data carriers (see Decision Point 3 for guidance on splitting behavioral variants). **Rationale**: The variants collectively define one closed type hierarchy; splitting them across files scatters the exhaustive-match guarantee and forces the reader to re-assemble the union mentally.
 - Place standalone `ValueConverter` classes in `Data/Conversions/` (not nested inside the configuration) when the converter contains non-trivial logic (see Decision Point 8). **Rationale**: Converters with domain knowledge like `DateTimeKind` restoration deserve their own file, namespace, and test surface.
 
 ### MAY
@@ -688,7 +693,7 @@ Zoran's approach enforces strict separation: the domain model must know nothing 
 
   Similarly, entities using primary constructors need a parameterless constructor:
   ```csharp
-  public class Transfer internal (TransferId id, Money amount, Timestamp executedAt)
+  internal class Transfer(TransferId id, Money amount, Timestamp executedAt)
   {
       private Transfer() : this(default!, default!, default!) { }  // Required by EF Core
       // ...
@@ -778,7 +783,7 @@ modelBuilder.Entity<Invoice>(entity =>
     entity.Property<int>("Id").ValueGeneratedOnAdd();
     entity.HasKey("Id");
 
-    entity.HasAlternateKey("InvoiceYear", "InvoiceSequence");     // composite natural key
+    entity.HasAlternateKey("InvoiceYear", "InvoiceSequence");     // composite natural key — shadow properties mapping InvoiceNumber columns; unreachable from the domain model
 
     entity.Ignore(e => e.Number);
     entity.Property<int>("InvoiceYear").HasColumnName("Number_Year");
@@ -850,6 +855,8 @@ using Microsoft.VisualStudio.TestTools.UnitTesting;
 
 namespace EndToEndTests.Companies;
 
+// This example shows web API testing via WebApplicationFactory.
+// For feature library tests, resolve the public interface directly from the DI container (see SHOULD above).
 [TestClass]
 [DoNotParallelize]
 public abstract class CreateCompanyTests
@@ -879,7 +886,7 @@ public abstract class CreateCompanyTests
         var request = new NewCompanyRequest("Test Company", "USA");
         var createdCompany = await CreateCompanyAsync(Client, request);
 
-        Assert.AreNotEqual(Guid.Empty.ToString(), createdCompany.Handle);
+        Assert.IsFalse(string.IsNullOrEmpty(createdCompany.Handle));
         Assert.AreEqual(request.Name, createdCompany.Name);
         Assert.AreEqual(request.IncorporatedInCode, createdCompany.IncorporatedInCode);
     }
@@ -1067,7 +1074,7 @@ Immutable domain models avoid accidental mutation but clash with Entity Framewor
 <!-- File: code-deep-immutable-ef-core/.../Invoice.cs -->
 
 ```csharp
-public class Invoice internal (
+internal class Invoice(
     InvoiceNumber number, string customerName, DateOnly invoicedOn,
     InvoiceStatus status, Currency currency)
 {
@@ -1192,14 +1199,14 @@ These patterns explicitly violate Zoran's conventions. If you generate any of th
 When you encounter a concept not shown in the examples, derive the correct pattern from the meta-principles:
 
 **To model a new value type** (e.g., `EmailAddress`, `GeoCoordinate`, `PhoneNumber`):
-1. Declare a `public record` with a positional primary constructor
+1. Declare an `internal record` with a positional primary constructor (use `public record` only in a shared kernel assembly — see Decision Point 6)
 2. Add `{ get; init; }` with ternary + throw for any invariants
 3. Use `nameof()` in all exceptions
 4. If construction can fail for user input, add a `TryCreateNew()` factory returning `T?`
 5. If the type needs arithmetic or comparison, define operator overloads
 
 **To model a new state machine** (e.g., `OrderStatus`, `PaymentState`):
-1. Root: `public abstract record BaseType;`
+1. Root: `internal abstract record BaseType;`
 2. Variants: `sealed record VariantName(...) : BaseType;`
 3. Group capabilities with marker interfaces
 4. All variant dispatch via exhaustive switch pattern matching
