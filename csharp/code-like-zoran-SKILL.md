@@ -11,7 +11,7 @@ You are generating C# code in the style of Zoran Horvat — functional domain mo
 **Target**: Domain-heavy line-of-business applications where business rule correctness matters more than development velocity.
 **Prerequisites**: .NET 10+, C# 14+, EF Core 10+. This skill uses C# 14 `extension` blocks, primary constructors, and EF Core `ComplexProperty` throughout.
 
-> **C# 14 `extension` blocks**: Syntax `extension(TargetType)` inside a static class defines methods callable via instance syntax on `TargetType`. Examples in Decision Points 2–5 use this syntax before its formal introduction in Decision Point 12. Treat them as static factory methods grouped by the type they extend for now.
+> **C# 14 `extension` blocks**: Syntax `extension(TargetType)` defines static extension members (called as `Type.Method()`). Add a receiver name, e.g. `extension(TargetType receiver)`, for instance members (called as `receiver.Method()`). Examples in Decision Points 2–5 use this syntax before its formal introduction in Decision Point 12.
 
 ## Meta-Principles
 
@@ -60,8 +60,6 @@ Value objects wrap primitive types in domain-meaningful types that enforce invar
 - MAY override `ToString()` for human-readable display of truncated identifiers. **Rationale**: Improves log and debug readability without exposing internal structure.
 - MAY define operator overloads for comparable types like timestamps and monetary amounts. **Rationale**: Enables natural comparison syntax (`ts1 > ts2`, `m1 + m2`) without forcing callers to unwrap primitive values. Note: operator overloads survive EF Core → SQL translation, enabling `db.Transfers.Where(t => t.ExecutedAt >= from)`.
 
-<!-- File: code-ef-core-complex-properties/.../TransferId.cs -->
-
 ```csharp
 internal record TransferId(Guid Id)
 {
@@ -76,8 +74,6 @@ internal record TransferId(Guid Id)
 }
 ```
 
-<!-- File: code-immutable-vs-mutable-persistence/.../AccountId.cs -->
-
 ```csharp
 internal record AccountId(Guid Id)
 {
@@ -89,8 +85,6 @@ internal record AccountId(Guid Id)
         id is Guid g && g != Guid.Empty ? new AccountId(g) : null;
 }
 ```
-
-<!-- File: code-immutable-vs-mutable-persistence/.../Iso4217Currency.cs -->
 
 ```csharp
 internal record Iso4217Currency(string AlphabeticCode, int NumericCode, int MinorUnit)
@@ -130,15 +124,22 @@ Entity constructors are `internal`, mutable state uses `{ get; private set; }`, 
 ### MAY
 - MAY use `required` init-only properties instead of constructor parameters for optional aggregate fields. **Rationale**: Allows callers to set only the properties they care about while keeping the constructor manageable.
 
-<!-- File: code-record-types-validation/.../Person.cs -->
-
 ```csharp
+internal record PersonId(Guid Id)
+{
+    public Guid Id { get; init; } =
+        Id != Guid.Empty ? Id
+        : throw new ArgumentException("PersonId cannot be empty", nameof(Id));
+
+    public static PersonId NewId() => new(Guid.NewGuid());
+}
+
 internal record class Person
 {
-    internal Person(Guid publicId, string firstName, string lastName) =>
+    internal Person(PersonId publicId, string firstName, string lastName) =>
         (PublicId, FirstName, LastName) = (publicId, firstName, lastName);
 
-    public Guid PublicId { get; }   // Wrap in a PersonId value object per Decision Point 1 in production code
+    public PersonId PublicId { get; }
     public string FirstName { get; }
     public string LastName { get; }
 }
@@ -147,20 +148,16 @@ internal static class PersonConstruction
 {
     extension(Person)
     {
-        public static Person? CreateNew(string firstName, string lastName) =>  // SHOULD name TryCreateNew per convention above
-            Person.CreateValid(Guid.NewGuid(), firstName, lastName);
+        public static Person? TryCreateNew(string firstName, string lastName) =>
+            string.IsNullOrWhiteSpace(firstName) ? null
+            : new(PersonId.NewId(), firstName.Trim(), lastName?.Trim() ?? string.Empty);
 
-        public static Person? Restore(Guid publicId, string firstName, string lastName) =>  // SHOULD name TryRestore
-            Person.CreateValid(publicId, firstName, lastName);
-
-        private static Person? CreateValid(Guid publicId, string firstName, string lastName) =>
+        public static Person? TryRestore(PersonId publicId, string firstName, string lastName) =>
             string.IsNullOrWhiteSpace(firstName) ? null
             : new(publicId, firstName.Trim(), lastName?.Trim() ?? string.Empty);
     }
 }
 ```
-
-<!-- File: code-ef-core-natural-keys/.../Invoice.cs — InEditable guard pattern -->
 
 ```csharp
 // NOTE: InvoiceStatus is shown as an enum for brevity. Per Decision Point 3,
@@ -186,8 +183,6 @@ internal class Invoice(
         : throw new ArgumentException("Customer name cannot be empty.", nameof(name));
 }
 ```
-
-<!-- File: code-ef-core-ddd-patterns/.../Invoice.cs -->
 
 ```csharp
 internal class Invoice
@@ -236,8 +231,6 @@ Discriminated unions model mutually exclusive states with exhaustive compile-tim
 - MAY use abstract classes instead of abstract records when mutable state is required in certain variants. **Rationale**: Records are naturally immutable; abstract classes support `{ get; private set; }` when a variant legitimately requires mutation.
 - MAY use partial class wrappers when a variant needs to carry substantial behavioral logic. **Rationale**: Keeps the union declaration file focused on type declarations alone.
 
-<!-- File: code-cs14-discriminated-unions/.../Estimate.cs -->
-
 ```csharp
 internal abstract record Estimate;
 internal sealed record Duration(TimeSpan Value) : Estimate;
@@ -263,8 +256,6 @@ public static class EstimateConstruction
 }
 ```
 
-<!-- File: code-cs14-discriminated-unions/.../EstimateComposition.cs — exhaustive tuple-pattern switch -->
-
 ```csharp
 public static class EstimateComposition
 {
@@ -281,8 +272,6 @@ public static class EstimateComposition
     }
 }
 ```
-
-<!-- File: code-immutable-vs-mutable-persistence/.../FourEyesApproval.cs -->
 
 ```csharp
 internal abstract record FourEyesApproval;
@@ -312,8 +301,6 @@ internal record FullyApproved(EmployeeId Approver1, EmployeeId Approver2) : Four
 
 internal record Rejected(EmployeeId Rejector) : FourEyesApproval;
 ```
-
-<!-- File: code-refactoring-anemic-model/.../Transfer.cs — abstract class state machine with marker interfaces -->
 
 ```csharp
 internal abstract class Transfer(
@@ -351,8 +338,6 @@ Property patterns handle value-based dispatch. Use `switch` expressions with pro
 
 ### MAY
 - MAY use nested records inside the same file as the pattern-matching logic when those records exist only to feed the state machine. **Rationale**: Keeps the domain simulation self-contained without polluting the project namespace.
-
-<!-- File: code-property-patterns/.../ComplexDomainDemo.cs -->
 
 ```csharp
 static class ComplexDomainDemo
@@ -416,9 +401,7 @@ Three failure-handling tiers. Hard failures (corrupt input): ternary + throw in 
 - MAY use the `Checked<T, TProblem>` monad when multiple validation steps must compose without short-circuiting. **Rationale**: `Bind()` accumulates all problems; exceptions abort at the first. Alternative: `Result<T>` or error lists.
 - MAY provide a `Match()` method on the checked monad for explicit success/failure branching at the consumption site. **Rationale**: Forces callers to handle both cases explicitly, preventing null-reference errors.
 - MAY accept a generic `TProblem` type (enum, string, custom record) in the checked monad. **Rationale**: Different domains may need different failure representations (error codes vs. messages vs. structured error objects).
-- MAY define monadic `extension(T?)` blocks with `Bind`, `Map`, `MapValue`, and `Match` for nullable types, both class and struct. See `code-csharp-monadic-types/final/Demo/NullableMonad.cs`. **Rationale**: Treating `T?` as a monad enables fluent pipelines on nullable values without repeated null checks.
-
-<!-- File: code-separation-of-concerns/.../Checked.cs -->
+- MAY define monadic `extension(T?)` blocks with `Bind`, `Map`, `MapValue`, and `Match` for nullable types, both class and struct. **Rationale**: Treating `T?` as a monad enables fluent pipelines on nullable values without repeated null checks.
 
 ```csharp
 abstract record Checked<T, TProblem>(T Value)
@@ -433,8 +416,6 @@ abstract record Checked<T, TProblem>(T Value)
 }
 ```
 
-<!-- File: code-separation-of-concerns/.../FileSystemRunner.cs — monadic Bind chain -->
-
 ```csharp
 string report = Locate(new FileInfo(filePath))              // Checked<FileInfo, string>
     .Bind(Read, [])                                          // Checked<string[], string>
@@ -446,8 +427,6 @@ string report = Locate(new FileInfo(filePath))              // Checked<FileInfo,
         onFailed: (lines, problem) => $"File check failed: {problem}"
     );
 ```
-
-<!-- File: code-csharp-monadic-types/.../NullableMonad.cs -->
 
 ```csharp
 static class NullableMonad
@@ -661,8 +640,7 @@ Strict separation: the domain knows nothing about persistence. Configuration bea
 
   **When to use `HasAlternateKey` vs `HasIndex().IsUnique()`**: Use `HasAlternateKey(e => e.PublicId)` when the domain key is a foreign key *target* in another entity. Use `HasIndex(t => t.Id).IsUnique()` when the domain key is queried but never referenced as a FK — it is lighter-weight and communicates "this is unique but nobody points at it."
 
-  <!-- File: code-ef-core-complex-properties/.../AppDbContext.cs -->
-  ```csharp
+```csharp
   b.HasIndex(t => t.Id).IsUnique();   // Unique index: queried but no FK references it
   ```
 
@@ -680,7 +658,6 @@ Strict separation: the domain knows nothing about persistence. Configuration bea
 
 - **Use `ComplexProperty` (not `OwnsOne`) for nested value objects.** `ComplexProperty` flattens value-object columns into the owning table — no JOINs, no separate tables. Nest `ComplexProperty` within `ComplexProperty` for multi-level value objects (e.g., `Transfer` → `Money` → `Currency`):
 
-  <!-- File: code-ef-core-complex-properties/.../AppDbContext.cs -->
   ```csharp
   b.ComplexProperty(t => t.Amount, m =>                   // Level 1: Transfer → Money
   {
@@ -703,7 +680,6 @@ Strict separation: the domain knows nothing about persistence. Configuration bea
 
 - **Add a private parameterless constructor on any value object used as a `ComplexProperty`.** EF Core materializes complex types by calling the parameterless constructor first, then backfilling properties:
 
-  <!-- File: code-ef-core-complex-properties/.../Money.cs -->
   ```csharp
   internal record Money(decimal Amount, Currency Currency)
   {
@@ -732,7 +708,6 @@ Strict separation: the domain knows nothing about persistence. Configuration bea
 
 - **Place converters in `Data/Conversions/` as standalone files when they contain non-trivial logic.** Trivial converters (simple wrap/unwrap) may be nested inside the entity configuration class or written as inline lambdas. Converters with domain knowledge deserve their own file:
 
-  <!-- File: code-ef-core-complex-properties/.../Conversions/TimestampConverter.cs -->
   ```csharp
   public class TimestampConverter : ValueConverter<Timestamp, DateTime>
   {
@@ -764,11 +739,9 @@ Strict separation: the domain knows nothing about persistence. Configuration bea
 - Use `builder.HasDiscriminator<string>().HasValue<TSubtype>()` with TPH inheritance for polymorphic aggregates like `Product → Material | Service`. **Rationale**: TPH avoids complex joins; EF Core materializes the correct subtype from the discriminator column in a single table scan.
 
 ### MAY
-- Consolidate all configuration inline in `OnModelCreating` (skipping `IEntityTypeConfiguration<T>`) for simple schemas with few entities. See `code-ef-core-complex-properties/final/Demo/Data/AppDbContext.cs` — one entity, everything inline. **Rationale**: For small projects, the ceremony of separate configuration files outweighs the organizational benefit.
+- Consolidate all configuration inline in `OnModelCreating` (skipping `IEntityTypeConfiguration<T>`) for simple schemas with few entities. **Rationale**: For small projects, the ceremony of separate configuration files outweighs the organizational benefit.
 - Hide EF Core navigation properties from the domain model with `builder.Ignore()` and map relationships through string-based overloads like `builder.HasMany<InvoiceLine>("LinesCollection")`. **Rationale**: Hiding navigations keeps domain classes free of EF concerns while `builder.Navigation("LinesCollection")` still enables eager loading in queries.
 - Omit explicit `IsRequired()` calls when using C# nullable reference types — the NRT annotations (`string` vs `string?`) already signal required vs optional to EF Core conventions. **Rationale**: NRT-driven convention is the modern, less verbose approach.
-
-<!-- File: code-ef-core-ddd-patterns/.../ProductConfiguration.cs — IEntityTypeConfiguration with TPH -->
 
 ```csharp
 public class ProductConfiguration : IEntityTypeConfiguration<Product>
@@ -795,8 +768,6 @@ public class ProductConfiguration : IEntityTypeConfiguration<Product>
     }
 }
 ```
-
-<!-- File: code-ef-core-natural-keys/.../DatabaseDbContext.cs — inline OnModelCreating with composite natural keys -->
 
 ```csharp
 modelBuilder.Entity<Invoice>(entity =>
@@ -870,8 +841,6 @@ Tests exercise real infrastructure — for feature libraries, the public interfa
 - Separate the HTTP call from assertions with a blank line to visually delimit the request phase from the verification phase. **Rationale**: Whitespace grouping replaces `// Act` / `// Assert` comments without adding noise.
 - Extract a static helper method like `CreateCompanyAsync(HttpClient client, NewCompanyRequest request)` when the same setup appears in three or more tests. **Rationale**: A shared helper eliminates copy-paste while remaining explicit about dependencies through its parameter list.
 - MAY add fast unit tests at interface boundaries for rapid feedback during active development. These test domain logic against mocked dependencies and provide sub-second feedback. **Rationale**: Integration tests against real infrastructure remain the merge gate, but unit tests speed up the inner development loop.
-
-<!-- File: code-openapi-docs/.../EndToEndTests/Companies/CreateCompanyTests.cs -->
 
 ```csharp
 using System.Net.Http.Json;
@@ -971,8 +940,6 @@ Zoran keeps every layer in its own type — domain models, database rows, query 
 ### MAY
 - MAY colocate the inline request DTO at the bottom of the feature's public interface file when the request type exists only for that single method. **Rationale**: Inline request records avoid polluting the project with one-line DTO files while keeping the binding type adjacent to its consuming method.
 
-<!-- File: code-record-types-validation/.../DataModels/PersonRow.cs -->
-
 ```csharp
 internal record class PersonRow(int Id, Guid PublicId, string FirstName, string LastName);
 
@@ -981,12 +948,10 @@ internal static class PersonConversions
     extension(PersonRow dataModel)
     {
         internal Person ToModel() =>
-            new Person(dataModel.PublicId, dataModel.FirstName, dataModel.LastName);
+            new Person(new PersonId(dataModel.PublicId), dataModel.FirstName, dataModel.LastName);
     }
 }
 ```
-
-<!-- File: code-minimal-api-primitive-obsession/.../Api/Responses/CompanyResponseDto.cs -->
 
 ```csharp
 public record class CompanyResponseDto(CompanyHandle Handle, string Name, string IncorporatedInCode, string IncorporatedInName);
@@ -1023,9 +988,7 @@ C# 14 introduces `extension(TargetType)` blocks, which Zoran uses pervasively in
 
 ### MAY
 - MAY define private helper methods in a separate `extension(AuxiliaryType)` block within the same static class. **Rationale**: Auxiliary extension blocks keep type-specific helpers scoped to the extension class without polluting the target type's namespace.
-- MAY define generic `extension<T>` blocks for utility methods applied to generic types. See `code-ef-core-complex-properties/final/Demo/Helpers.cs` for `extension<T>(IEnumerable<T> sequence) { ... }`. **Rationale**: Generic extension blocks apply a method to any type parameter while keeping the helper discoverable near the domain it serves.
-
-<!-- File: code-record-types-superpower/.../Book.cs -->
+- MAY define generic `extension<T>` blocks for utility methods applied to generic types. **Rationale**: Generic extension blocks apply a method to any type parameter while keeping the helper discoverable near the domain it serves.
 
 ```csharp
 // Requires: using System.Collections.Immutable;
@@ -1053,8 +1016,6 @@ public static class BookCreation
     }
 }
 ```
-
-<!-- File: code-cs14-discriminated-unions/.../EstimateComposition.cs -->
 
 ```csharp
 public static class EstimateComposition
@@ -1098,8 +1059,6 @@ public static class EstimateComposition
 ### MAY
 - MAY use `ImmutableList<T>` for collection properties in deep-immutable aggregates. **Rationale**: Prevents accidental mutation of the backing collection from any reference holder. However, `ImmutableList<T>` has O(log n) indexed access, ~40 bytes per element memory overhead, and is not natively supported as an EF Core navigation type — EF Core cannot initialize or materialize `ImmutableList<T>` automatically (dotnet/efcore issue #21176, open since 2020). The recommended pattern for EF Core aggregates is the `private List<T>` backing field with `public IReadOnlyCollection<T>` accessor shown in Decision Point 2.
 - MAY use reflection-based key extraction in `UpdateImmutable<T>()` for generic collection alignment. **Rationale**: Avoids writing per-entity-type sync logic. The name `UpdateImmutable` is misleading — the pattern mutates collections inside EF Core's change tracker, defeating the purpose of immutability. Consider naming it `SyncCollection<T>` or `ApplyCollectionDiff<T>`.
-
-<!-- File: code-deep-immutable-ef-core/.../Invoice.cs -->
 
 ```csharp
 internal class Invoice(
@@ -1155,8 +1114,6 @@ DI follows a minimal recipe: register the `DbContext` and nothing else for data 
 
 ### SHOULD
 - Use primary constructors for DI-injected classes whose parameters map directly to stored fields. **Rationale**: Removes the ceremony of private readonly field declarations and assignment-only constructor bodies.
-
-<!-- File: code-openapi-docs/.../Program.cs -->
 
 ```csharp
 using Microsoft.EntityFrameworkCore;
