@@ -54,7 +54,7 @@ Value objects wrap primitive types in domain-meaningful types that enforce invar
 - SHOULD provide a static `NewId()` factory method for ID value objects that wraps `Guid.NewGuid()`. **Rationale**: Centralizes GUID generation; makes intent explicit at the call site.
 - SHOULD provide a well-known `Empty` sentinel property for ID types that wraps `Guid.Empty`, and well-known static instances for reference-data value objects (`Currency.USD`, `Timestamp.UtcNow`). **Rationale**: Eliminates null checks and provides explicit, searchable representations. For reference-data types, static instances serve as a canonical registry discoverable at the call site.
 - SHOULD include more than a single field in value objects when additional data naturally clusters with the core value (e.g., `Iso4217Currency` in `Money`). **Rationale**: Co-locating related data prevents primitive obsession and enables domain arithmetic without back-referencing external data.
-- SHOULD bundle domain rules into the value object itself — not in a separate service. Example: `Currency` carries `DecimalPlaces` (called `MinorUnit` in ISO 4217) so `Money` can auto-round without consulting an external configuration. **Rationale**: The value object becomes both identity and policy carrier; callers never need to know which currency has which precision. When reference data comes from an external source or needs dependency injection, MAY use a provider/registry pattern (`IIso4217CurrencyProvider`) instead of embedding all metadata in the value object.
+- SHOULD bundle domain rules into the value object itself — not in a separate service. Example: `Currency` carries `DecimalPlaces` so `Money` can auto-round without consulting an external configuration. **Rationale**: The value object becomes both identity and policy carrier; callers never need to know which currency has which precision. When reference data comes from an external source or needs dependency injection, MAY use a provider/registry pattern (`IIso4217CurrencyProvider`) instead of embedding all metadata in the value object.
 
 ### MAY
 - MAY override `ToString()` for human-readable display of truncated identifiers. **Rationale**: Improves log and debug readability without exposing internal structure.
@@ -88,7 +88,7 @@ internal record AccountId(Guid Id)
 ```
 
 ```csharp
-internal record Iso4217Currency(string AlphabeticCode, int NumericCode, int MinorUnit)
+internal record Iso4217Currency(string AlphabeticCode, int NumericCode, int DecimalPlaces)
 {
     public string AlphabeticCode { get; init; } =
         !string.IsNullOrWhiteSpace(AlphabeticCode) && AlphabeticCode.Length == 3 && AlphabeticCode.All(char.IsUpper) ? AlphabeticCode
@@ -98,9 +98,9 @@ internal record Iso4217Currency(string AlphabeticCode, int NumericCode, int Mino
         NumericCode > 0 && NumericCode <= 999 ? NumericCode
         : throw new ArgumentException("Numeric code must be a three-digit number between 001 and 999.", nameof(NumericCode));
 
-    public int MinorUnit { get; init; } =
-        MinorUnit >= 0 ? MinorUnit
-        : throw new ArgumentException("Minor unit must be a non-negative integer.", nameof(MinorUnit));
+    public int DecimalPlaces { get; init; } =
+        DecimalPlaces >= 0 ? DecimalPlaces
+        : throw new ArgumentException("Minor unit must be a non-negative integer.", nameof(DecimalPlaces));
 }
 ```
 
@@ -164,11 +164,14 @@ internal static class PersonConstruction
 ```
 
 ```csharp
-// NOTE: InvoiceStatus is shown as an enum for brevity. Per Decision Point 3,
-// prefer a discriminated union for entity state (e.g., Editing | Issued | Void).
+// Inline discriminated union for invoice state — see Decision Point 3
+internal abstract record InvoiceState;
+internal sealed record Editing : InvoiceState;
+internal sealed record Issued : InvoiceState;
+
 internal class Invoice(
     InvoiceNumber number, string customerName, DateOnly invoicedOn,
-    InvoiceStatus status, Currency currency)
+    InvoiceState status, Currency currency)
 {
     public string CustomerName
     {
@@ -179,7 +182,7 @@ internal class Invoice(
     public Currency Currency { get; set => field = InEditable(value); } = currency;
 
     private TValue InEditable<TValue>(TValue value) =>
-        Status == InvoiceStatus.Editing ? value
+        Status is Editing ? value
         : throw new InvalidOperationException("Cannot modify issued invoice.");
 
     private static string AsValidCustomerName(string name) =>
@@ -482,7 +485,7 @@ A feature ships as a self-contained class library with one or two public interfa
   SharedKernel/
   ├── Money.cs          → public record Money(decimal Amount, Iso4217Currency Currency)
   ├── Timestamp.cs      → public record Timestamp(DateTime Value)
-  └── Currency.cs       → public record Currency(string AlphabeticCode, int NumericCode, int MinorUnit)
+  └── Currency.cs       → public record Currency(string AlphabeticCode, int NumericCode, int DecimalPlaces)
   ```
 
 ### MAY
@@ -673,11 +676,11 @@ Strict separation: the domain knows nothing about persistence. Configuration bea
 
       m.ComplexProperty(x => x.Currency, c =>             // Level 2: Money → Currency
       {
-          c.Property(x => x.Code)
-              .HasColumnName("CurrencyCode")
-              .HasColumnType("varchar(3)");                    // varchar, not nvarchar — currency codes are ASCII
-      c.Property(x => x.MinorUnit)
-          .HasColumnName("CurrencyMinorUnit");
+c.Property(x => x.Code)
+    .HasColumnName("CurrencyCode")
+    .HasColumnType("varchar(3)");                    // Provably ASCII-only — ISO 4217 currency codes are always 3 uppercase letters
+c.Property(x => x.DecimalPlaces)
+    .HasColumnName("CurrencyDecimalPlaces");
       });
   });
   ```
@@ -708,8 +711,8 @@ Strict separation: the domain knows nothing about persistence. Configuration bea
 
   ```csharp
   public decimal Amount { get; init; }
-      = Math.Round(Amount, Currency?.MinorUnit ?? 0);
-  //                       ^^^^^^^^^ null-conditional: Currency might not be populated yet
+= Math.Round(Amount, Currency?.DecimalPlaces ?? 0);
+//                           ^^^^^^^^^^^^^^ null-conditional: Currency might not be populated yet
   ```
 
 - **Place converters in `Data/Conversions/` as standalone files when they contain non-trivial logic.** Trivial converters (simple wrap/unwrap) may be nested inside the entity configuration class or written as inline lambdas. Converters with domain knowledge deserve their own file:
@@ -1209,7 +1212,7 @@ These patterns explicitly violate Zoran's conventions. If you generate any of th
 | `string` for identifiers (`string handle`, `string currencyCode`) | Dedicated type: `CompanyHandle`, `Currency`, `Iso4217Currency` |
 | Shadow PK named `"Id"` when domain model already has an `Id` property | Rename shadow PK to `"Key"` with `HasColumnName("Id")` |
 | `DateTimeKind` stripped silently by SQL Server | Reapply `DateTime.SpecifyKind(dt, DateTimeKind.Utc)` in value converter |
-| Assuming `ComplexProperty` sub-objects populate in order | Null-conditional guard: `Currency?.MinorUnit ?? 0` |
+| Assuming `ComplexProperty` sub-objects populate in order | Null-conditional guard: `Currency?.DecimalPlaces ?? 0` |
 
 ---
 
