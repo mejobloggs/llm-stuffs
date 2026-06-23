@@ -4,9 +4,14 @@ description: Generate C# code in Zoran Horvat's style
 ---
 
 
-You are generating C# code in the style of Zoran Horvat — a C# architect known for functional domain modeling, discriminated unions, and extreme discipline around value objects, immutability, and explicit domain boundaries.
+You are generating C# code in the style of Zoran Horvat — functional domain modeling, discriminated unions, value objects, immutability, explicit domain boundaries.
 
 ---
+
+**Target**: Domain-heavy line-of-business applications where business rule correctness matters more than development velocity.
+**Prerequisites**: .NET 10+, C# 14+, EF Core 10+. This skill uses C# 14 `extension` blocks, primary constructors, and EF Core `ComplexProperty` throughout.
+
+> **C# 14 `extension` blocks**: Syntax `extension(TargetType)` inside a static class defines methods callable via instance syntax on `TargetType`. Examples in Decision Points 2–5 use this syntax before its formal introduction in Decision Point 12. Treat them as static factory methods grouped by the type they extend for now.
 
 ## Meta-Principles
 
@@ -18,31 +23,31 @@ Every `string`, `Guid`, `decimal`, and `DateTime` crossing between layers must b
 
 ### Principle 2: "Invalid objects must be unrepresentable."
 
-Validation happens in construction — not in a separate `Validate()` method called later. The type system itself guarantees correctness: a `Money` instance can never hold a negative amount; an `AccountId` can never be `Guid.Empty`; a `Timestamp` can never be non-UTC. If you can hold an invalid object in memory, you will eventually process it. Make it impossible to create.
+Validation happens in construction — not in a separate `Validate()` method called later. The type system itself guarantees correctness: a `Money` instance can never hold a negative amount; an `AccountId` can never be `Guid.Empty`; a `Timestamp` can never be non-UTC. If you can hold an invalid object in memory, you will eventually process it.
 
 ### Principle 3: "Public constructors are a last resort — use factories."
 
-Domain types have `internal` constructors. Construction happens through `static class XxxConstruction { extension(Xxx) { ... } }` factory methods returning `T?` (null means validation failure) or throwing on truly invalid input. Factories can fail gracefully, accumulate errors, or perform cross-field validation that single-property `init` accessors cannot.
+Domain types have `internal` constructors. Construction happens through `static class XxxConstruction { extension(Xxx) { ... } }` factory methods returning `T?` (null = validation failure) or throwing on truly invalid input. Factories enable cross-field validation that single-property `init` accessors cannot.
 
 ### Principle 4: "Tell the compiler what you know — not what the database knows."
 
 Entities declare their intent via types (discriminated unions, state machines with abstract records), not flags (`bool IsApproved`, `enum Status`). Use `abstract record` + sealed variants for finite states. Use property patterns (`switch` with `when` guards) for value-based dispatch. Use `IEntityTypeConfiguration` to bridge the gap between domain types and database columns. The domain model drives the design. The database conforms to the domain — never the reverse.
 
-### Principle 5: "One concept, one file, one public type."
+### Principle 5: "One concept, one file, one type."
 
 No `Utils.cs`, no `Helpers.cs`, no `Constants.cs`, no `Enums.cs`. Every concept gets its own file. Even small types like `Temperature`, `Humidity`, `AccountId` earn dedicated files. A developer looking for `AccountId` finds it immediately — not buried inside a `Common.cs` catch-all.
 
 ---
 
-> **Companion types**: Many code examples reference types (`Currency`, `InvoiceStatus`, `InvoiceNumber`, `Money`, `EmployeeId`, `TransferTimestamp`, `AirExchange`, `Temperature`, `Sensors`, `AppDbContext`, `TransferResult`, `TransferRequestDto`, `TransferSummaryDto`, `AccountIdDto`, `Passed<T,TProblem>`, `Failed<T,TProblem>`, `IncompleteApproval`, `ApprovedTransfer`, `ICompletedApproval`, `IIncompleteApproval`) that are not defined in this file. These are companion types assumed to exist per the patterns demonstrated in their respective decision points. When generating code, create these types following the same conventions shown here.
+> **Companion types**: Code examples reference types not defined in this file (`Currency`, `InvoiceStatus`, `AppDbContext`, `IncompleteApproval`, `ApprovedTransfer`, `ICompletedApproval`, `IIncompleteApproval`, etc.). These follow the same conventions as the types shown here; generate them accordingly.
 
 ## Decision Point 1: Creating a Value Object
 
-Value objects wrap primitive types in domain-meaningful types that enforce invariants at construction, making invalid states unrepresentable. Use C# records for structural equality semantics; use `{ get; init; }` with ternary + throw in the property initializer so validation fires before the object materializes. Static factory methods provide well-known instances (`Empty`, `UtcNow`, `NewId()`) while keeping the primary constructor internal for deserialization. Never add implicit conversion operators — they hide allocation and bypass validation.
+Value objects wrap primitive types in domain-meaningful types that enforce invariants at construction. Use `{ get; init; }` with ternary + throw for fail-fast validation. Static factory methods provide well-known instances (`Empty`, `UtcNow`, `NewId()`) while keeping the primary constructor internal for deserialization. Never add implicit conversion operators — they hide allocation and bypass validation.
 
 ### MUST
 - MUST declare value objects as `internal record` with a primary constructor wrapping the underlying primitive. **Rationale**: Records deliver structural equality and `{ get; init; }` value semantics out of the box. Value objects are internal to their feature library (see Decision Point 6); value objects shared across multiple features belong in a shared kernel assembly where they may be `public record`.
-- MUST validate in the `{ get; init; }` property initializer using ternary + throw, never in a separate `Validate()` method or `IsValid` property on domain objects. **Rationale**: The object must never exist in an invalid state; construction-time failure is fail-fast. (UI-layer types such as view models may legitimately expose `IsValid` for displaying validation errors before submission — this rule applies to the domain model.)
+- MUST validate in the `{ get; init; }` property initializer using ternary + throw, never in a separate `Validate()` method or `IsValid` property on domain objects. **Rationale**: The object must never exist in an invalid state; construction-time failure is fail-fast. (UI view models may expose `IsValid`; this rule is for domain objects.)
 - MUST include `nameof()` in every `ArgumentException` call that refers to a parameter name. **Rationale**: Eliminates magic strings that silently rot under rename refactoring.
 
 ### SHOULD
@@ -108,18 +113,19 @@ internal record Iso4217Currency(string AlphabeticCode, int NumericCode, int Mino
 
 ## Decision Point 2: Creating a Domain Aggregate/Entity
 
-Aggregates enforce consistency boundaries through controlled mutation paths. Constructors are `internal` to force construction through static factory methods; this guarantees invariants are checked and normalization is applied (e.g., string trimming) before an instance exists. Mutable state uses `{ get; private set; }` while immutable one-time-set properties use `{ get; init; }`. Private collection backing fields paired with a public `IEnumerable<>` accessor prevent external mutation of child entity collections.
+Entity constructors are `internal`, mutable state uses `{ get; private set; }`, immutable state uses `{ get; init; }`. Private `List<T>` backing fields with public `IEnumerable<T>` accessors prevent external mutation of child collections.
 
 ### MUST
 - MUST declare entity constructors as `internal`, never `public`. **Rationale**: Forces all construction through controlled factory methods that can normalize input and reject invalid combinations.
-- MUST use `{ get; private set; }` for mutable state and `{ get; init; }` for immutable one-time-set properties. **Rationale**: Makes mutation intentional and scoped; `private set` exposes mutation only to the aggregate itself.
-- MUST back collection properties with a private `List<T>` field and expose a public `IEnumerable<T>` or `IReadOnlyCollection<T>` accessor. **Rationale**: Prevents external code from adding, removing, or replacing child entities without going through aggregate methods.
+- MUST use `{ get; private set; }` for mutable state and `{ get; init; }` for immutable one-time-set properties. **Rationale**: `private set` scopes mutation to the aggregate.
+- MUST back collection properties with a private `List<T>` field and expose a public `IEnumerable<T>` or `IReadOnlyCollection<T>` accessor. **Rationale**: Prevents external mutation of child collections.
 
 ### SHOULD
 - SHOULD provide a static `XxxConstruction` class containing `extension(Xxx)` factory methods for construction and persistence reconstitution. **Rationale**: Separates construction logic from the aggregate itself, keeping the type focused on behavior rather than factory boilerplate.
 - SHOULD name factory methods `TryCreateNew()` (returning `T?` for user-input validation) and `TryRestore()` (returning `T?` for persistence reconstitution). **Rationale**: The naming convention distinguishes fresh creation from database reconstitution; nullable return signals soft failure to the caller.
 - SHOULD place nested ID record structs inside the aggregate class. **Rationale**: Scopes the ID type to its owning aggregate and avoids namespace pollution.
-- SHOULD gate mutable setters behind a status check (`InEditable<TValue>()`) when some states forbid mutation (e.g., an issued invoice cannot be modified). **Rationale**: Encodes the state machine's transition rules at the property level, making it impossible to mutate a property in an invalid state rather than checking elsewhere.
+- SHOULD gate mutable setters behind a status check (`InEditable<TValue>()`) when some states forbid mutation (e.g., an issued invoice cannot be modified). **Rationale**: Encodes state-machine rules at the property level.
+- SHOULD model entity state as a discriminated union property (see Decision Point 3) rather than an enum or flag, and guard mutable operations with pattern-match checks against the current state. Example: `_state is Editing edit ? PerformEdit(edit) : throw...`.
 
 ### MAY
 - MAY use `required` init-only properties instead of constructor parameters for optional aggregate fields. **Rationale**: Allows callers to set only the properties they care about while keeping the constructor manageable.
@@ -132,19 +138,19 @@ internal record class Person
     internal Person(Guid publicId, string firstName, string lastName) =>
         (PublicId, FirstName, LastName) = (publicId, firstName, lastName);
 
-    public Guid PublicId { get; }
+    public Guid PublicId { get; }   // Wrap in a PersonId value object per Decision Point 1 in production code
     public string FirstName { get; }
     public string LastName { get; }
 }
 
-public static class PersonConstruction
+internal static class PersonConstruction
 {
     extension(Person)
     {
-        public static Person? CreateNew(string firstName, string lastName) =>
+        public static Person? CreateNew(string firstName, string lastName) =>  // SHOULD name TryCreateNew per convention above
             Person.CreateValid(Guid.NewGuid(), firstName, lastName);
 
-        public static Person? Restore(Guid publicId, string firstName, string lastName) =>
+        public static Person? Restore(Guid publicId, string firstName, string lastName) =>  // SHOULD name TryRestore
             Person.CreateValid(publicId, firstName, lastName);
 
         private static Person? CreateValid(Guid publicId, string firstName, string lastName) =>
@@ -157,6 +163,8 @@ public static class PersonConstruction
 <!-- File: code-ef-core-natural-keys/.../Invoice.cs — InEditable guard pattern -->
 
 ```csharp
+// NOTE: InvoiceStatus is shown as an enum for brevity. Per Decision Point 3,
+// prefer a discriminated union for entity state (e.g., Editing | Issued | Void).
 internal class Invoice(
     InvoiceNumber number, string customerName, DateOnly invoicedOn,
     InvoiceStatus status, Currency currency)
@@ -172,6 +180,10 @@ internal class Invoice(
     private TValue InEditable<TValue>(TValue value) =>
         Status == InvoiceStatus.Editing ? value
         : throw new InvalidOperationException("Cannot modify issued invoice.");
+
+    private static string AsValidCustomerName(string name) =>
+        !string.IsNullOrWhiteSpace(name) ? name.Trim()
+        : throw new ArgumentException("Customer name cannot be empty.", nameof(name));
 }
 ```
 
@@ -180,7 +192,7 @@ internal class Invoice(
 ```csharp
 internal class Invoice
 {
-    public readonly record struct InvoiceId(Guid Value)
+    internal readonly record struct InvoiceId(Guid Value)
     {
         public static InvoiceId Empty { get; } = new InvoiceId(Guid.Empty);
         public static InvoiceId NewId() => new InvoiceId(Guid.NewGuid());
@@ -305,7 +317,7 @@ internal record Rejected(EmployeeId Rejector) : FourEyesApproval;
 
 ```csharp
 internal abstract class Transfer(
-    Money amount, Guid id, AccountId from, AccountId to,
+    Money amount, TransferId id, AccountId from, AccountId to,
     TransferTimestamp expiresAt, FourEyesApproval approval) { /* ... */ }
 
 internal class PendingTransfer : Transfer
@@ -326,11 +338,11 @@ internal class PendingTransfer : Transfer
 
 ## Decision Point 4: Using Property Patterns & Pattern Matching
 
-Property patterns handle value-based dispatch — the counterpart to discriminated unions' type-based dispatch. Use nested `switch` expressions with property patterns (`{ State: State.Heating }`), tuple patterns (`(device, sensors) switch`), `when` guards for threshold tests, and the `not` pattern for negation. These patterns composes naturally into state-machine decision chains that a reader can verify exhaustively.
+Property patterns handle value-based dispatch. Use `switch` expressions with property patterns, tuple patterns, `when` guards, and `not` patterns. These compose naturally into state-machine decision chains that the compiler can verify exhaustively.
 
 ### MUST
-- MUST use `switch` expressions (not statements) for value-based pattern matching. **Rationale**: Expressions return a value and guarantee exhaustiveness; statements can silently fall through.
-- MUST use property patterns to destructure records in switch arms: `{ State: State.Off }`, `{ Temperature: var temp }`. **Rationale**: Property patterns extract exactly the fields needed for the decision without verbose constructor destructuring.
+- MUST use `switch` expressions (not statements) for value-based pattern matching. **Rationale**: Expressions guarantee exhaustiveness; statements silently fall through.
+- MUST use property patterns to destructure records in switch arms: `{ State: State.Off }`, `{ Temperature: var temp }`. **Rationale**: Property patterns extract only the needed fields.
 
 ### SHOULD
 - SHOULD use tuple patterns `(a, b) switch { ... }` when dispatching on two or more values simultaneously. **Rationale**: Tuple patterns let the compiler check exhaustiveness of the cross-product, catching combinations an if/else chain would miss.
@@ -391,17 +403,17 @@ static class ComplexDomainDemo
 
 ## Decision Point 5: Handling Validation / Construction Failure
 
-Three distinct failure-handling tiers exist. Hard failures — where input is provably corrupt (e.g., empty GUID, negative amount) — use ternary + throw in property initializers; there is no recovery path. Soft failures — where user input may be invalid — use `TryCreateNew()` returning `T?` (null signals invalid). For multi-step validation chains where all errors must accumulate rather than short-circuit, the `Checked<T, TProblem>` monad (see MAY below) is available.
+Three failure-handling tiers. Hard failures (corrupt input): ternary + throw in property initializers — no recovery. Soft failures (invalid user input): `TryCreateNew()` returning `T?`. Multi-step chains where all errors must accumulate: `Checked<T, TProblem>` monad (see MAY below).
 
 ### MUST
-- MUST use ternary + throw in property initializers for invariants that are never expected to fail under correct system operation (e.g., non-empty GUID, non-negative amount). **Rationale**: These are programming errors, not recoverable input errors; the stack trace pinpoints the bug immediately.
-- MUST NOT define `bool IsValid { get; }` properties or `void Validate()` methods called after construction on domain objects. **Rationale**: Post-construction validation creates a window where an invalid object exists; construction-time validation closes that window entirely. UI-layer types such as view models may legitimately expose `IsValid` for displaying validation errors before submission — this rule applies to the domain model.
+- MUST use ternary + throw in property initializers for invariants that are never expected to fail under correct system operation (e.g., non-empty GUID, non-negative amount). **Rationale**: Programming errors; the stack trace pinpoints the bug.
+- MUST NOT define `bool IsValid { get; }` properties or `void Validate()` methods called after construction on domain objects. **Rationale**: Post-construction validation creates a window where an invalid object exists. (UI view models may expose `IsValid`; this rule is for domain objects.)
 
 ### SHOULD
 - SHOULD use `TryCreateNew()` returning `T?` for user-input scenarios where failure is expected and recoverable. **Rationale**: Nullable return signals "try again" to the caller without throwing exceptions for normal control flow.
 
 ### MAY
-- MAY use the `Checked<T, TProblem>` monad when multiple validation steps must compose without short-circuiting. **Rationale**: Monadic `Bind()` chains accumulate all problems before returning, unlike exception-throwing which aborts at the first failure. Teams unfamiliar with monadic composition may prefer simpler alternatives such as `Result<T>` or accumulated error lists.
+- MAY use the `Checked<T, TProblem>` monad when multiple validation steps must compose without short-circuiting. **Rationale**: `Bind()` accumulates all problems; exceptions abort at the first. Alternative: `Result<T>` or error lists.
 - MAY provide a `Match()` method on the checked monad for explicit success/failure branching at the consumption site. **Rationale**: Forces callers to handle both cases explicitly, preventing null-reference errors.
 - MAY accept a generic `TProblem` type (enum, string, custom record) in the checked monad. **Rationale**: Different domains may need different failure representations (error codes vs. messages vs. structured error objects).
 - MAY define monadic `extension(T?)` blocks with `Bind`, `Map`, `MapValue`, and `Match` for nullable types, both class and struct. See `code-csharp-monadic-types/final/Demo/NullableMonad.cs`. **Rationale**: Treating `T?` as a monad enables fluent pipelines on nullable values without repeated null checks.
@@ -464,20 +476,30 @@ static class NullableMonad
 
 ## Decision Point 6: Designing a Feature Library's Public API
 
-A feature ships as a self-contained class library whose "API" is the set of public interfaces and extension methods a consumer sees — not HTTP routes. Every domain model, entity, value object, EF Core configuration class, and internal service is `internal`. The consumer adds the feature with a single `services.AddFeatureXxx()` call and interacts through one or two public interfaces.
+A feature ships as a self-contained class library with one or two public interfaces. Everything else — domain models, entities, value objects, EF Core configuration — is `internal`. One `services.AddFeatureXxx()` call registers it.
 
 ### MUST
-- MUST expose exactly one or two `public interface` types as the consumer's sole entry point to the feature. Example: `IMoneyTransferService`, `IInvoiceGenerator`. **Rationale**: One interface tells the consumer everything the feature can do. Two when read and write paths have meaningfully different contracts.
-- MUST keep domain models, entities, value objects, EF Core configuration, and internal services as `internal`. **Rationale**: The domain is the feature's private implementation. Exposing domain types to consumers couples them to internal representations; changes to domain types should never break consumers. If a value object (e.g., `Money`, `Timestamp`) is shared across multiple feature libraries, extract it into a shared kernel assembly — but within a single feature, domain types remain internal.
+- MUST expose exactly one or two `public interface` types as the consumer's sole entry point to the feature. Example: `IMoneyTransferService`, `IInvoiceGenerator`. **Rationale**: One interface for the feature; two if read and write paths differ.
+- MUST keep domain models, entities, value objects, EF Core configuration, and internal services as `internal`. **Rationale**: The domain is private implementation; exposing it couples consumers to internals. Extract shared types to a shared kernel (see SHOULD below).
 - MUST provide an `IServiceCollection` extension method that registers the entire feature in one call: `services.AddTransfers(configuration)`. **Rationale**: A single registration call replaces the consumer's need to understand the feature's internal dependency graph — one `AddXxx()` and the feature is wired.
-- MUST return DTOs and result records from public interface methods — never domain entities or value objects. **Rationale**: DTOs form an explicit, versionable contract between the feature and its consumers. Returning a domain object leaks the internal model and breaks consumers when the model evolves.
-- MUST validate inputs at the public interface boundary before they reach domain logic. **Rationale**: The public API is the trust boundary between the outside world and the domain's make-invalid-unrepresentable guarantees; `.TryCreate()` calls and null checks belong here, not buried in internal services.
+- MUST return DTOs and result records from public interface methods — never domain entities or value objects. **Rationale**: DTOs form a versionable contract; returning domain objects breaks consumers on model changes.
+- MUST validate inputs at the public interface boundary before they reach domain logic. **Rationale**: The public API is the trust boundary; validate here, not in internal services.
 
 ### SHOULD
 - SHOULD use the Options pattern (`IOptions<FeatureOptions>`) for feature configuration, with static defaults so `AddTransfers()` works with zero additional setup. **Rationale**: Options classes self-document every configurable knob; sensible defaults mean the consumer overrides only what they need.
-- SHOULD design public interface methods as stateless pure functions of their parameters — pass `DbContext` or other dependencies at the implementation level, not on the interface itself. **Rationale**: Stateless signatures are trivially testable; stateful interface methods hide side effects and make callers guess which method must be called first.
-- SHOULD colocate the DI registration extension method inside the feature library itself, in the `Microsoft.Extensions.DependencyInjection` namespace. **Rationale**: The library owns its registration contract; the consumer only needs a `using` directive and a package reference.
-- SHOULD return `Task<T?>` or a result union from methods where failure is expected and recoverable — never throw across the public API boundary for business-rule rejections. **Rationale**: Exceptions are for programmer errors; nullable returns and result types are for "this input wasn't valid, try again" — they force the caller to confront the failure path.
+- SHOULD design public interface methods as stateless pure functions of their parameters — pass `DbContext` or other dependencies at the implementation level, not on the interface itself. **Rationale**: Stateless signatures are trivially testable.
+- SHOULD colocate the DI registration extension method inside the feature library itself, in the `Microsoft.Extensions.DependencyInjection` namespace. **Rationale**: The library owns its registration; consumer only needs a `using` directive.
+- SHOULD return `Task<T?>` or a result union from methods where failure is expected and recoverable — never throw across the public API boundary for business-rule rejections. **Rationale**: Exceptions for programmer errors; nullable/result types for recoverable failures.
+- SHOULD extract shared value objects (`Money`, `Timestamp`, `Currency`) into a shared kernel assembly when they are used by multiple feature libraries. In the shared kernel, these types may be `public record`. **Rationale**: Prevents duplicate implementations of the same concept across features. Within a single feature, domain types remain `internal`.
+- SHOULD inject `ILogger<T>` into internal service implementations and log validation failures, business rule rejections, and exceptions. **Rationale**: The public API boundary and validation points are natural logging locations; structured logging enables production diagnostics without coupling to a specific sink.
+
+  Example `SharedKernel` project:
+  ```
+  SharedKernel/
+  ├── Money.cs          → public record Money(decimal Amount, Iso4217Currency Currency)
+  ├── Timestamp.cs      → public record Timestamp(DateTime Value)
+  └── Currency.cs       → public record Currency(string AlphabeticCode, int NumericCode, int MinorUnit)
+  ```
 
 ### MAY
 - MAY use `InternalsVisibleTo` for the feature's test project only — never for sibling feature libraries. **Rationale**: Tests need internal access to arrange state and verify invariants; sibling features communicate exclusively through the public API to maintain decoupling.
@@ -586,17 +608,16 @@ app.MapPost("/transfers", async (
 
 ## Decision Point 7: Organizing Files and Namespaces
 
-Zoran's project organization enforces a strict one-to-one mapping from filesystem to namespace, eliminating the mental cost of locating types. File-scoped namespaces and the one-type-per-file rule make every `using` directive trivially traceable to a single file. Multi-project solutions use `<RootNamespace>` in `.csproj` to collapse assembly names down to their logical namespace prefix, so the compiler sees `TbdModern.WebApi` regardless of the `.csproj` file name `WebApiModern.csproj`.
+One-to-one filesystem-to-namespace mapping. File-scoped namespaces, one type per file. `<RootNamespace>` in `.csproj` decouples the project file name from the namespace.
 
 ### MUST
-- Use file-scoped namespaces exclusively: `namespace X.Y.Z;` with no braces. **Rationale**: Eliminates one level of indentation and the useless closing brace region that IDEs otherwise require.
-- Place exactly one type per file. **Rationale**: The filename tells you the type; a file named `Company.cs` never surprises with a second exported concept.
-- Match the namespace exactly to the folder path from the project root. **Rationale**: `Models/` → `namespace X.Models;` makes locating any type a mechanical filesystem walk with zero ambiguity.
-- Set `<RootNamespace>` in every `.csproj` so the project file name does not leak into C# namespaces. **Rationale**: Decouples the project file name (which may evolve) from the namespace contract referenced by hundreds of source files.
+- Use file-scoped namespaces exclusively: `namespace X.Y.Z;` with no braces. **Rationale**: Eliminates one level of indentation.
+- Place exactly one type per file. **Rationale**: The filename is the type.
+- Set `<RootNamespace>` in every `.csproj` so the project file name does not leak into C# namespaces. **Rationale**: Decouples project file name from namespace.
 
 ### SHOULD
-- Colocate discriminated union variants in a single file when they are simple data carriers (see Decision Point 3 for guidance on splitting behavioral variants). **Rationale**: The variants collectively define one closed type hierarchy; splitting them across files scatters the exhaustive-match guarantee and forces the reader to re-assemble the union mentally.
-- Place standalone `ValueConverter` classes in `Data/Conversions/` (not nested inside the configuration) when the converter contains non-trivial logic (see Decision Point 8). **Rationale**: Converters with domain knowledge like `DateTimeKind` restoration deserve their own file, namespace, and test surface.
+- Colocate discriminated union variants in a single file when they are simple data carriers (see Decision Point 3 for guidance on splitting behavioral variants). **Rationale**: The variants define one closed hierarchy; splitting scatters exhaustiveness.
+- Place standalone `ValueConverter` classes in `Data/Conversions/` (not nested inside the configuration) when the converter contains non-trivial logic (see Decision Point 8). **Rationale**: Converters with domain knowledge deserve their own file.
 
 ### MAY
 - Keep a console demo project flat when it has fewer than five source files. **Rationale**: Adding `Models/` and `UseCases/` folders for three files creates directory noise with no navigational benefit.
@@ -615,7 +636,7 @@ Zoran's project organization enforces a strict one-to-one mapping from filesyste
 
 ## Decision Point 8: Configuring EF Core (DbContext + Entity Config)
 
-Zoran's approach enforces strict separation: the domain model must know nothing about persistence; the configuration layer bears sole responsibility for mapping domain types to relational schema. Every choice — shadow keys, alternate keys, ComplexProperty, value converters — serves the goal of keeping the domain model pure while giving EF Core exactly what it needs to generate clean, navigable SQL.
+Strict separation: the domain knows nothing about persistence. Configuration bears sole responsibility for mapping. Shadow keys, alternate keys, `ComplexProperty`, value converters — keep the domain pure, give EF Core what it needs.
 
 ### MUST
 
@@ -672,8 +693,8 @@ Zoran's approach enforces strict separation: the domain model must know nothing 
           c.Property(x => x.Code)
               .HasColumnName("CurrencyCode")
               .HasColumnType("varchar(3)");                    // varchar, not nvarchar — currency codes are ASCII
-          c.Property(x => x.DecimalPlaces)
-              .HasColumnName("CurrencyDecimalPlaces");
+      c.Property(x => x.MinorUnit)
+          .HasColumnName("CurrencyMinorUnit");
       });
   });
   ```
@@ -705,7 +726,7 @@ Zoran's approach enforces strict separation: the domain model must know nothing 
 
   ```csharp
   public decimal Amount { get; init; }
-      = Math.Round(Amount, Currency?.DecimalPlaces ?? 0);
+      = Math.Round(Amount, Currency?.MinorUnit ?? 0);
   //                       ^^^^^^^^^ null-conditional: Currency might not be populated yet
   ```
 
@@ -738,7 +759,7 @@ Zoran's approach enforces strict separation: the domain model must know nothing 
   }
   ```
 
-- Place each `IEntityTypeConfiguration<T>` in a dedicated file under `Data/Aggregates/`, one class per aggregate root. **Rationale**: Configuration isolation by aggregate mirrors the domain model's modularity and keeps `OnModelCreating` a short registry of `ApplyConfiguration` calls.
+- Place each `IEntityTypeConfiguration<T>` in a dedicated file under `Data/EntityConfiguration/`, one class per entity. **Rationale**: Configuration isolation mirrors the domain model's modularity and keeps `OnModelCreating` a short registry of `ApplyConfiguration` calls.
 - Nest child-entity configuration classes inside the parent aggregate configuration (e.g., `InvoiceConfiguration.InvoiceLineConfiguration`). **Rationale**: Nesting communicates ownership and discoverability — readers find all configuration for an aggregate in one file.
 - Use `builder.HasDiscriminator<string>().HasValue<TSubtype>()` with TPH inheritance for polymorphic aggregates like `Product → Material | Service`. **Rationale**: TPH avoids complex joins; EF Core materializes the correct subtype from the discriminator column in a single table scan.
 
@@ -815,6 +836,8 @@ Handler methods receive `DbContext` directly as a parameter — no repository ab
 - Use `AsNoTracking()` on all read-only queries — `db.Companies.AsNoTracking().FirstOrDefaultAsync(...)`. **Rationale**: Read queries must never trigger unintended database writes through the change tracker.
 - Use `Include("LinesCollection")` with string-based navigation names when eager-loading child collections that are hidden from the domain model. **Rationale**: The string-based overload maps to the shadow navigation configured in `IEntityTypeConfiguration` or inline `OnModelCreating`.
 - Place entity configuration in `Data/EntityConfiguration/` — one `IEntityTypeConfiguration<T>` file per entity, applied via `modelBuilder.ApplyConfiguration()` in `OnModelCreating()`. **Rationale**: Keeps mapping logic separate from the `DbContext` and the domain model, so neither knows about the other.
+- For multi-entity write operations, wrap in a transaction: `await using var tx = await db.Database.BeginTransactionAsync(ct);` and commit/rollback explicitly. **Rationale**: Multiple `SaveChangesAsync` calls without a transaction boundary leave the database in an inconsistent state on partial failure.
+- Handle `DbUpdateConcurrencyException` at the service layer when optimistic concurrency conflicts occur. Retry or surface the conflict to the caller as a recoverable failure. **Rationale**: Line-of-business applications with concurrent editors need explicit conflict resolution; silent overwrites are unacceptable.
 
 ### MAY
 - For large projects with many query paths, extract complex read queries into dedicated query classes in `Data/Queries/` that take `DbContext` as a dependency. **Rationale**: Prevents the `DbContext` class itself from accumulating query logic.
@@ -846,6 +869,7 @@ Tests exercise real infrastructure — for feature libraries, the public interfa
 - Call `response.EnsureSuccessStatusCode()` on happy-path responses before deserializing. **Rationale**: A failed status code throws immediately with the actual status, avoiding confusing null-reference errors downstream.
 - Separate the HTTP call from assertions with a blank line to visually delimit the request phase from the verification phase. **Rationale**: Whitespace grouping replaces `// Act` / `// Assert` comments without adding noise.
 - Extract a static helper method like `CreateCompanyAsync(HttpClient client, NewCompanyRequest request)` when the same setup appears in three or more tests. **Rationale**: A shared helper eliminates copy-paste while remaining explicit about dependencies through its parameter list.
+- MAY add fast unit tests at interface boundaries for rapid feedback during active development. These test domain logic against mocked dependencies and provide sub-second feedback. **Rationale**: Integration tests against real infrastructure remain the merge gate, but unit tests speed up the inner development loop.
 
 <!-- File: code-openapi-docs/.../EndToEndTests/Companies/CreateCompanyTests.cs -->
 
@@ -857,6 +881,7 @@ namespace EndToEndTests.Companies;
 
 // This example shows web API testing via WebApplicationFactory.
 // For feature library tests, resolve the public interface directly from the DI container (see SHOULD above).
+// Requires: <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" />
 [TestClass]
 [DoNotParallelize]
 public abstract class CreateCompanyTests
@@ -1003,6 +1028,7 @@ C# 14 introduces `extension(TargetType)` blocks, which Zoran uses pervasively in
 <!-- File: code-record-types-superpower/.../Book.cs -->
 
 ```csharp
+// Requires: using System.Collections.Immutable;
 internal record Book(Guid Id, string Title, ImmutableList<Author> Authors);
 
 public static class BookCreation
@@ -1045,6 +1071,8 @@ public static class EstimateComposition
         };
 
         public Estimate InParallelWith(Estimate other) =>
+            // NOTE: This example assumes an extended Estimate model with Optimistic/Pessimistic
+            // properties and FromNullable/NullableMax helpers. See the full source for the complete model.
             Estimate.FromNullable(
                 TimeSpan.NullableMax(estimate.Optimistic, other.Optimistic),
                 TimeSpan.NullableMax(estimate.Pessimistic, other.Pessimistic));
@@ -1056,7 +1084,7 @@ public static class EstimateComposition
 
 ## Decision Point 13: Handling Concurrency / Mutable State in an Immutable World
 
-Immutable domain models avoid accidental mutation but clash with Entity Framework Core's change tracking. The bridge is a copy-constructor pattern: each `With*` method copies the object via a private copy-constructor and sets only the changed property via `{ get; init; }`. For EF Core persistence, one approach is an `UpdateImmutable<T>()` extension method that detaches the original tracked entity, copies scalar/complex property values from the modified copy, and recursively aligns collection and reference navigation graphs using key-based matching.
+**Advanced pattern for aggregates requiring deep immutability** (event sourcing, strict concurrent editing). For most entities, prefer the `{ get; private set; }` mutation pattern in Decision Point 2. Immutable domain models avoid accidental mutation but clash with Entity Framework Core's change tracking. The bridge is a copy-constructor pattern: each `With*` method copies the object via a private copy-constructor and sets only the changed property via `{ get; init; }`. For EF Core persistence, one approach is an `UpdateImmutable<T>()` extension method that detaches the original tracked entity, copies scalar/complex property values from the modified copy, and recursively aligns collection and reference navigation graphs using key-based matching.
 
 ### MUST
 - MUST define a private copy-constructor that shallow-copies all properties from another instance of the same type. **Rationale**: Provides a single, auditable copy point that every `With*` method delegates to.
@@ -1093,18 +1121,22 @@ internal class Invoice(
         !string.IsNullOrEmpty(customerName) ? customerName
         : throw new ArgumentException("Customer name cannot be null or empty.", nameof(customerName));
 
-    public ImmutableList<InvoiceLine> Lines
+    private List<InvoiceLine> _lines = new();
+    public IReadOnlyCollection<InvoiceLine> Lines
     {
-        get;
-        init => field =
-            value.All(line => line.UnitPrice.Currency == Currency) ? value
-            : throw new ArgumentException("Mismatched currencies found in invoice lines.");
-    } = ImmutableList<InvoiceLine>.Empty;
+        get => _lines.AsReadOnly();
+        init
+        {
+            if (value.Any(line => line.UnitPrice.Currency != Currency))
+                throw new ArgumentException("Mismatched currencies found in invoice lines.");
+            _lines = value.ToList();
+        }
+    }
 
     public Invoice WithCustomerName(string customerName) =>
         new(this) { CustomerName = customerName };
 
-    public Invoice WithLines(ImmutableList<InvoiceLine> lines) =>
+    public Invoice WithLines(IReadOnlyCollection<InvoiceLine> lines) =>
         new(this) { Lines = lines };
 }
 ```
@@ -1190,9 +1222,16 @@ These patterns explicitly violate Zoran's conventions. If you generate any of th
 | `string` for identifiers (`string handle`, `string currencyCode`) | Dedicated type: `CompanyHandle`, `Currency`, `Iso4217Currency` |
 | Shadow PK named `"Id"` when domain model already has an `Id` property | Rename shadow PK to `"Key"` with `HasColumnName("Id")` |
 | `DateTimeKind` stripped silently by SQL Server | Reapply `DateTime.SpecifyKind(dt, DateTimeKind.Utc)` in value converter |
-| Assuming `ComplexProperty` sub-objects populate in order | Null-conditional guard: `Currency?.DecimalPlaces ?? 0` |
+| Assuming `ComplexProperty` sub-objects populate in order | Null-conditional guard: `Currency?.MinorUnit ?? 0` |
 
 ---
+
+## Performance Considerations
+
+- **`ImmutableList<T>`**: O(log n) indexed access, ~40 bytes per element overhead, ~100x slower `ToImmutableList()` vs `AsReadOnly()`. Prefer `private List<T>` + `public IReadOnlyCollection<T>` for EF Core collection navigations. See Decision Point 2 for the recommended collection pattern.
+- **Copy-constructor pattern**: Allocates a new object per mutation. Acceptable for domain operations (infrequent); avoid in hot paths. See Decision Point 13.
+- **`UpdateImmutable<T>()`**: Reflection-based collection alignment. Acceptable for small collections; write explicit per-aggregate sync for large graphs. See Decision Point 13.
+- **`{ get; init; }` with ternary + throw**: Executes validation once at construction — zero ongoing cost. See Decision Point 1.
 
 ## Extrapolating to New Domains
 
