@@ -52,13 +52,14 @@ Value objects wrap primitive types in domain-meaningful types that enforce invar
 
 ### SHOULD
 - SHOULD provide a static `NewId()` factory method for ID value objects that wraps `Guid.NewGuid()`. **Rationale**: Centralizes GUID generation; makes intent explicit at the call site.
-- SHOULD provide a well-known `Empty` sentinel property for ID types that wraps `Guid.Empty`. **Rationale**: Eliminates null checks and provides an explicit, searchable "no value" representation.
+- SHOULD provide a well-known `Empty` sentinel property for ID types that wraps `Guid.Empty`, and well-known static instances for reference-data value objects (`Currency.USD`, `Timestamp.UtcNow`). **Rationale**: Eliminates null checks and provides explicit, searchable representations. For reference-data types, static instances serve as a canonical registry discoverable at the call site.
 - SHOULD include more than a single field in value objects when additional data naturally clusters with the core value (e.g., `Iso4217Currency` in `Money`). **Rationale**: Co-locating related data prevents primitive obsession and enables domain arithmetic without back-referencing external data.
-- SHOULD bundle domain rules into the value object itself — not in a separate service. Example: `Currency` carries `DecimalPlaces` (called `MinorUnit` in ISO 4217) so `Money` can auto-round without consulting an external configuration. **Rationale**: The value object becomes both identity and policy carrier; callers never need to know which currency has which precision.
+- SHOULD bundle domain rules into the value object itself — not in a separate service. Example: `Currency` carries `DecimalPlaces` (called `MinorUnit` in ISO 4217) so `Money` can auto-round without consulting an external configuration. **Rationale**: The value object becomes both identity and policy carrier; callers never need to know which currency has which precision. When reference data comes from an external source or needs dependency injection, MAY use a provider/registry pattern (`IIso4217CurrencyProvider`) instead of embedding all metadata in the value object.
 
 ### MAY
 - MAY override `ToString()` for human-readable display of truncated identifiers. **Rationale**: Improves log and debug readability without exposing internal structure.
 - MAY define operator overloads for comparable types like timestamps and monetary amounts. **Rationale**: Enables natural comparison syntax (`ts1 > ts2`, `m1 + m2`) without forcing callers to unwrap primitive values. Note: operator overloads survive EF Core → SQL translation, enabling `db.Transfers.Where(t => t.ExecutedAt >= from)`.
+- MAY use `record struct` instead of `record` for small, frequently-allocated value types (currency codes, monetary amounts, IDs). **Rationale**: Value types avoid heap allocation and reduce GC pressure. When used, validation typically moves to the entity aggregate level since `record struct` init accessors differ from reference-type records.
 
 ```csharp
 internal record TransferId(Guid Id)
@@ -120,9 +121,12 @@ Entity constructors are `internal`, mutable state uses `{ get; private set; }`, 
 - SHOULD place nested ID record structs inside the aggregate class. **Rationale**: Scopes the ID type to its owning aggregate and avoids namespace pollution.
 - SHOULD gate mutable setters behind a status check (`InEditable<TValue>()`) when some states forbid mutation (e.g., an issued invoice cannot be modified). **Rationale**: Encodes state-machine rules at the property level.
 - SHOULD model entity state as a discriminated union property (see Decision Point 3) rather than an enum or flag, and guard mutable operations with pattern-match checks against the current state. Example: `_state is Editing edit ? PerformEdit(edit) : throw...`.
+- SHOULD use the `field` keyword (C# 13+) in `set` and `init` accessors when validation logic or mutation gating needs access to the backing value. **Rationale**: Eliminates the boilerplate of declaring a separate private backing field when all the accessor does is validate-then-assign. Example: `set => field = InEditable(value);` or `init => field = value.All(...) ? value : throw ...`.
+- SHOULD use `private init` for identity properties that must never change after construction (e.g., `Ordinal`, `Id` on child entities). **Rationale**: `private init` allows setting during construction or via a `With*` factory within the same type, but blocks all external mutation — the compiler enforces that the property is set exactly once.
 
 ### MAY
 - MAY use `required` init-only properties instead of constructor parameters for optional aggregate fields. **Rationale**: Allows callers to set only the properties they care about while keeping the constructor manageable.
+- MAY define computed properties that aggregate over child collections (e.g., `Invoice.Total`, `Order.Subtotal`). **Rationale**: Derived values that are a pure function of the aggregate's state should live on the aggregate, not in a separate service or query layer.
 
 ```csharp
 internal record PersonId(Guid Id)
@@ -338,6 +342,7 @@ Property patterns handle value-based dispatch. Use `switch` expressions with pro
 
 ### MAY
 - MAY use nested records inside the same file as the pattern-matching logic when those records exist only to feed the state machine. **Rationale**: Keeps the domain simulation self-contained without polluting the project namespace.
+- MAY use list patterns (`[]`, `[var single]`, `[var first, ..]`) for dispatch on collection shape. **Rationale**: List patterns express intent more directly than indexing or `Count` checks, and produce exhaustiveness warnings when shapes are missed.
 
 ```csharp
 static class ComplexDomainDemo
@@ -506,7 +511,7 @@ public interface IMoneyTransferService
 
 ```csharp
 internal sealed class TransferService(
-    AppDbContext db,
+    IDbContextFactory<AppDbContext> contextFactory,
     IOptions<TransferOptions> options) : IMoneyTransferService
 {
     public async Task<TransferResult?> RequestTransferAsync(
@@ -523,6 +528,7 @@ internal sealed class TransferService(
         var transfer = Transfer.TryCreateNew(from, to, amount, options.Value.MaxTransferAmount);
         if (transfer is null) return null;
 
+        await using var db = await contextFactory.CreateDbContextAsync(ct);
         db.Transfers.Add(transfer);
         await db.SaveChangesAsync(ct);
         return TransferResult.FromTransfer(transfer);
@@ -545,7 +551,7 @@ public static class TransferServiceCollectionExtensions
         services.Configure<TransferOptions>(
             configuration.GetSection("Transfers"));
         services.AddScoped<IMoneyTransferService, TransferService>();
-        services.AddDbContext<AppDbContext>(options =>
+        services.AddDbContextFactory<AppDbContext>(options =>
             options.UseSqlServer(configuration.GetConnectionString("TransfersDb")));
         return services;
     }
@@ -737,6 +743,7 @@ Strict separation: the domain knows nothing about persistence. Configuration bea
 - Place each `IEntityTypeConfiguration<T>` in a dedicated file under `Data/EntityConfiguration/`, one class per entity. **Rationale**: Configuration isolation mirrors the domain model's modularity and keeps `OnModelCreating` a short registry of `ApplyConfiguration` calls.
 - Nest child-entity configuration classes inside the parent aggregate configuration (e.g., `InvoiceConfiguration.InvoiceLineConfiguration`). **Rationale**: Nesting communicates ownership and discoverability — readers find all configuration for an aggregate in one file.
 - Use `builder.HasDiscriminator<string>().HasValue<TSubtype>()` with TPH inheritance for polymorphic aggregates like `Product → Material | Service`. **Rationale**: TPH avoids complex joins; EF Core materializes the correct subtype from the discriminator column in a single table scan.
+- SHOULD decompose composite value objects into private shadow stand-in properties on the entity when the value object serves as a natural key referenced by child entities. **Rationale**: Shadow properties give full column-level control in the Fluent API while keeping the decomposed value object private to the entity. Example: `InvoiceNumber` decomposed into `private int InvoiceYear` and `private int InvoiceSequence`, with `entity.Ignore(e => e.Number)`, shadow properties mapped via `entity.Property<int>("InvoiceYear")`, and a composite alternate key `entity.HasAlternateKey("InvoiceYear", "InvoiceSequence")`. Child entities reference this via `HasForeignKey("InvoiceNumberYear", "InvoiceNumberSequence").HasPrincipalKey("InvoiceYear", "InvoiceSequence")`.
 
 ### MAY
 - Consolidate all configuration inline in `OnModelCreating` (skipping `IEntityTypeConfiguration<T>`) for simple schemas with few entities. **Rationale**: For small projects, the ceremony of separate configuration files outweighs the organizational benefit.
@@ -759,6 +766,23 @@ public class ProductConfiguration : IEntityTypeConfiguration<Product>
             .HasDiscriminator<string>("Type")
             .HasValue<Material>("Material")
             .HasValue<Service>("Service");
+    }
+
+    // Nested child-type configuration — discoverable with the parent aggregate
+    public class MaterialConfiguration : IEntityTypeConfiguration<Material>
+    {
+        public void Configure(EntityTypeBuilder<Material> builder)
+        {
+            builder.Property(m => m.PricePerUnit).HasPrecision(18, 2);
+        }
+    }
+
+    public class ServiceConfiguration : IEntityTypeConfiguration<Service>
+    {
+        public void Configure(EntityTypeBuilder<Service> builder)
+        {
+            builder.Property(s => s.HourlyRate).HasPrecision(18, 2);
+        }
     }
 
     public class ProductIdConverter : ValueConverter<Product.ProductId, Guid>
@@ -796,11 +820,11 @@ modelBuilder.Entity<Invoice>(entity =>
 
 ## Decision Point 9: Persisting Domain Objects (Simplified)
 
-Handler methods receive `DbContext` directly as a parameter — no repository abstractions, no unit-of-work interfaces. Queries always use the domain key (the alternate key or unique index), never the shadow primary key. Reads use `AsNoTracking()` to avoid change-tracker overhead; writes use the default tracking behavior and call `SaveChangesAsync()` to persist.
+Handler methods receive `IDbContextFactory<T>` via DI, then create a short-lived `DbContext` per unit of work with `await using`. No repository abstractions, no unit-of-work interfaces. Queries always use the domain key (the alternate key or unique index), never the shadow primary key. Reads use `AsNoTracking()` to avoid change-tracker overhead; writes use the default tracking behavior and call `SaveChangesAsync()` to persist.
 
 ### MUST
 - Query exclusively by the domain key via LINQ — `db.Companies.FirstOrDefaultAsync(c => c.PublicId == id)`. Never call `DbSet<T>.Find(key)`. **Rationale**: `Find()` operates on the shadow primary key known only to EF Core, bypassing the domain's identity boundary entirely.
-- Inject the `DbContext` directly into consuming classes — `PostAsync(AppDbContext db, NewRequestDto request)`. **Rationale**: One injection covers all entity types; no repository-per-aggregate boilerplate.
+- Inject `IDbContextFactory<T>` into consuming classes, then create and dispose a `DbContext` per unit of work: `await using var db = await _contextFactory.CreateDbContextAsync();`. **Rationale**: Short-lived contexts prevent stale tracked entities; dispose promptly to free database connections.
 - Query domain-typed properties through their `ComplexProperty`-mapped navigation paths — `db.Transfers.Where(t => t.Amount.Currency.Code == "USD")`. **Rationale**: `ComplexProperty` translates deeply nested LINQ expressions to flat SQL columns — use it.
 
 ### SHOULD
@@ -1104,16 +1128,22 @@ internal class Invoice(
 
 ## Decision Point 14: Setting Up DI / Project Wiring
 
-DI follows a minimal recipe: register the `DbContext` and nothing else for data access. Feature classes receive the `DbContext` directly as a parameter — no repository interfaces, no service locator, no extra abstraction layers. The container never calls back into itself — there is no `IServiceProvider` argument and no `GetService<T>()` outside the composition root.
+DI follows a minimal recipe: register an `IDbContextFactory<T>` and nothing else for data access. Feature classes receive the factory, create a short-lived `DbContext` per unit of work via `await using`, and dispose it promptly. No repository interfaces, no service locator, no extra abstraction layers. The container never calls back into itself — there is no `IServiceProvider` argument and no `GetService<T>()` outside the composition root.
 
 ### MUST
-- Register EF Core `DbContext` with `AddDbContext<T>()` and a connection-string-derived options callback. **Rationale**: `AddDbContext` configures the scoped lifetime, pooled factory, and disposal orchestration.
+- Register EF Core `DbContext` with `AddDbContextFactory<T>()` and a connection-string-derived options callback. **Rationale**: The factory pattern gives explicit control over context lifetime; each unit of work creates a fresh, short-lived `DbContext` that is disposed when the `using` block exits, preventing long-lived change tracker accumulation.
+- Create a new `DbContext` per unit of work with `await using var db = await _contextFactory.CreateDbContextAsync();`. **Rationale**: Short-lived contexts prevent stale tracked entities and reduce memory pressure from accumulated change tracker entries.
 - Enable `Nullable` and `ImplicitUsings` in every `.csproj`. **Rationale**: Nullable guards force explicit null-handling decisions; implicit usings eliminate boilerplate `using` lines for `System`, `System.Linq`, etc.
 - Use only parameter injection in consuming classes — never pass `IServiceProvider` into a class. **Rationale**: Parameter injection makes dependencies explicit in the method signature; service location hides them.
 - Use `System.Text.Json` exclusively for all JSON serialization — never add a `Newtonsoft.Json` package reference or use `JsonConvert`. **Rationale**: `System.Text.Json` is built into .NET, requires zero external dependencies, and has been the standard since .NET Core 3.0.
 
 ### SHOULD
 - Use primary constructors for DI-injected classes whose parameters map directly to stored fields. **Rationale**: Removes the ceremony of private readonly field declarations and assignment-only constructor bodies.
+- SHOULD use `TypedResults` with explicit return type unions (`Results<Ok<T>, ProblemHttpResult>`) when OpenAPI documentation is required. **Rationale**: Typed return values enable `[Produces]` attribute metadata generation and compile-time verification that all response types are handled.
+
+### MAY
+- MAY use `AddPooledDbContextFactory<T>()` instead of `AddDbContextFactory<T>()` when benchmarks prove pooling reduces allocation pressure. **Rationale**: Pooling recycles context instances to reduce GC overhead; however, Microsoft recommends only switching when performance testing shows a real benefit. The factory pattern and `using` usage pattern remain identical — only the registration method changes.
+- MAY centralize API error responses in a static `Problem` class with domain-specific factory methods (`Problem.CompanyNotFound()`, `Problem.InvalidRequestFields(...)`). **Rationale**: Eliminates duplicated `TypedResults.Problem()` calls with magic strings; makes the set of possible errors discoverable by scanning one file.
 
 ```csharp
 using Microsoft.EntityFrameworkCore;
@@ -1129,7 +1159,7 @@ builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.Converters.Add(new CompanyHandleConverter());
 });
 
-builder.Services.AddDbContext<AppDbContext>(options =>
+builder.Services.AddDbContextFactory<AppDbContext>(options =>
     options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
 
 var app = builder.Build();
@@ -1164,7 +1194,7 @@ These patterns explicitly violate Zoran's conventions. If you generate any of th
 | `[Required] public string Name` on a domain model | `{ get; init; }` with ternary + throw validation |
 | `[Key]` or `[Column]` attributes on domain classes | Fluent API `IEntityTypeConfiguration<T>` in `Data/EntityConfiguration/` |
 | `DbSet<T>.Find(id)` | `FirstOrDefaultAsync(e => e.PublicId == domainKey)` |
-| Wrapping `DbContext` in `IRepository<TAggregate, TKey>` | Inject `DbContext` directly into consuming classes |
+| Wrapping `DbContext` in `IRepository<TAggregate, TKey>` | Inject `IDbContextFactory<T>` and create short-lived contexts with `await using` |
 | `OwnsOne` / `OwnsMany` for value objects | `ComplexProperty` (EF Core 8+) — flattens into owning table, no JOINs |
 | Forgetting parameterless constructor on value objects used in `ComplexProperty` | Add `private Money() : this(default, default!) { }` — required for EF Core materialization |
 | `ControllerBase` subclass | `public static class Xxx { ... }` with static Minimal API methods |
