@@ -11,7 +11,7 @@ You are generating C# code in the style of Zoran Horvat — functional domain mo
 **Target**: Domain-heavy line-of-business applications where business rule correctness matters more than development velocity.
 **Prerequisites**: .NET 10+, C# 14+, EF Core 10+. This skill uses C# 14 `extension` blocks, primary constructors, and EF Core `ComplexProperty` throughout.
 
-> **C# 14 `extension` blocks**: Syntax `extension(TargetType)` defines static extension members (called as `Type.Method()`). Add a receiver name, e.g. `extension(TargetType receiver)`, for instance members (called as `receiver.Method()`). Examples in Decision Points 2–5 use this syntax before its formal introduction in Decision Point 12.
+> ⚠️ **C# 14 `extension` blocks — READ BEFORE DP2**: Syntax `extension(TargetType)` defines static extension members (called as `Type.Method()`). Add a receiver name, e.g. `extension(TargetType receiver)`, for instance-like members (called as `receiver.Method()`). Both forms live inside a `public static class XxxRole { ... }`. The examples in DPs 2–5 use this syntax extensively; see Decision Point 12 for the full specification. **If a call like `Plan.TryCreateNew(...)` or `estimate.Add(other)` looks unfamiliar, flip to DP12 now.**
 
 ## Meta-Principles
 
@@ -52,6 +52,7 @@ Value objects wrap primitive types in domain-meaningful types that enforce invar
 
 ### SHOULD
 - SHOULD provide a static `NewId()` factory method for ID value objects that wraps `Guid.NewGuid()`. **Rationale**: Centralizes GUID generation; makes intent explicit at the call site.
+- SHOULD prefer `Guid`-wrapped IDs for public-facing identifiers (exposed in DTOs, URLs, or external systems) for their non-guessability and global uniqueness. **Rationale**: `Guid` IDs prevent enumeration attacks and eliminate coordination overhead in distributed systems. MAY use `int` or `long`-wrapped IDs for internal identifiers where sequential ordering or compact storage matters.
 - SHOULD provide a well-known `Empty` sentinel property for ID types that wraps `Guid.Empty`, and well-known static instances for reference-data value objects (`Currency.USD`, `Timestamp.UtcNow`). **Rationale**: Eliminates null checks and provides explicit, searchable representations. For reference-data types, static instances serve as a canonical registry discoverable at the call site.
 - SHOULD include more than a single field in value objects when additional data naturally clusters with the core value (e.g., `Iso4217Currency` in `Money`). **Rationale**: Co-locating related data prevents primitive obsession and enables domain arithmetic without back-referencing external data.
 - SHOULD bundle domain rules into the value object itself — not in a separate service. Example: `Currency` carries `DecimalPlaces` so `Money` can auto-round without consulting an external configuration. **Rationale**: The value object becomes both identity and policy carrier; callers never need to know which currency has which precision. When reference data comes from an external source or needs dependency injection, MAY use a provider/registry pattern (`IIso4217CurrencyProvider`) instead of embedding all metadata in the value object.
@@ -60,6 +61,10 @@ Value objects wrap primitive types in domain-meaningful types that enforce invar
 - MAY override `ToString()` for human-readable display of truncated identifiers. **Rationale**: Improves log and debug readability without exposing internal structure.
 - MAY define operator overloads for comparable types like timestamps and monetary amounts. **Rationale**: Enables natural comparison syntax (`ts1 > ts2`, `m1 + m2`) without forcing callers to unwrap primitive values. Note: operator overloads survive EF Core → SQL translation, enabling `db.Transfers.Where(t => t.ExecutedAt >= from)`.
 - MAY use `record struct` instead of `record` for small, frequently-allocated value types (currency codes, monetary amounts, IDs). **Rationale**: Value types avoid heap allocation and reduce GC pressure. When used, validation typically moves to the entity aggregate level since `record struct` init accessors differ from reference-type records.
+
+> ⚠️ **EF Core `ComplexProperty` requires a private parameterless constructor on value objects.** If your value object will be flattened into an entity table via `ComplexProperty` (see Decision Point 8), you MUST add `private TypeName() : this(default, default!) { }`. Without it, EF Core cannot materialize the object and will throw at runtime. Add it when you create the value object — don't backfill later.
+>
+> ⚠️ **`with` expressions bypass property initializer validation on records.** The compiler-generated copy constructor used by `with` does a field-by-field copy and does NOT run property initializers (the `= value ?? throw` part). This means `original with { Id = Guid.Empty }` silently skips the validation guard. Fix: move validation into the `init` accessor body using the C# 14 `field` keyword: `init => field = value ?? throw ...`. This fires for both `new` and `with`. Caveat: cross-property validation in `init` accessors is order-sensitive — the order of assignments in the `with` expression determines which property validates against which.
 
 ```csharp
 internal record TransferId(Guid Id)
@@ -143,9 +148,9 @@ internal record class Person
     internal Person(PersonId publicId, string firstName, string lastName) =>
         (PublicId, FirstName, LastName) = (publicId, firstName, lastName);
 
-    public PersonId PublicId { get; }
-    public string FirstName { get; }
-    public string LastName { get; }
+    public PersonId PublicId { get; init; }
+    public string FirstName { get; init; }
+    public string LastName { get; init; }
 }
 
 internal static class PersonConstruction
@@ -328,6 +333,18 @@ internal class PendingTransfer : Transfer
 }
 ```
 
+> 🔮 **C# 15 / .NET 11+**: Native `union` types supersede the `abstract record` + `sealed record` pattern. The native syntax provides compiler-enforced exhaustiveness (no `_` discard required), a closed hierarchy (no external derivation possible), and first-class IDE support. Prefer this when targeting .NET 11+:
+> ```csharp
+> // C# 15+ — native union replaces the abstract record pattern above
+> public record class Pending();
+> public record class PartlyApproved(EmployeeId Approver);
+> public record class FullyApproved(EmployeeId First, EmployeeId Second);
+> public record class Rejected(EmployeeId Rejector);
+> 
+> public union FourEyesApproval(Pending, PartlyApproved, FullyApproved, Rejected);
+> ```
+> For .NET 10 / C# 14, the `abstract record` + `sealed record` pattern shown above remains the recommended approach.
+
 ---
 
 ## Decision Point 4: Using Property Patterns & Pattern Matching
@@ -421,6 +438,35 @@ abstract record Checked<T, TProblem>(T Value)
     public abstract Checked<U, TProblem> Bind<U>(Func<T, Checked<U, TProblem>> func, U orElse);
     public abstract Checked<U, TProblem> Map<U>(Func<T, U> func);
     public abstract U Match<U>(Func<T, U> onPassed, Func<T, TProblem, U> onFailed);
+}
+
+sealed record Passed<T, TProblem>(T Value) : Checked<T, TProblem>(Value)
+{
+    public override Checked<T, TProblem> Bind(Func<T, Checked<T, TProblem>> func) =>
+        func(Value);
+
+    public override Checked<U, TProblem> Bind<U>(Func<T, Checked<U, TProblem>> func, U orElse) =>
+        func(Value) is Failed<U, TProblem> ? Checked<U, TProblem>.Unit(orElse) : func(Value);
+
+    public override Checked<U, TProblem> Map<U>(Func<T, U> func) =>
+        Checked<U, TProblem>.Unit(func(Value));
+
+    public override U Match<U>(Func<T, U> onPassed, Func<T, TProblem, U> onFailed) =>
+        onPassed(Value);
+}
+
+sealed record Failed<T, TProblem>(T Value, TProblem Problem) : Checked<T, TProblem>(Value)
+{
+    public override Checked<T, TProblem> Bind(Func<T, Checked<T, TProblem>> func) => this;
+
+    public override Checked<U, TProblem> Bind<U>(Func<T, Checked<U, TProblem>> func, U orElse) =>
+        Checked<U, TProblem>.Unit(orElse);
+
+    public override Checked<U, TProblem> Map<U>(Func<T, U> func) =>
+        Checked<U, TProblem>.Failed(func(Value), Problem);
+
+    public override U Match<U>(Func<T, U> onPassed, Func<T, TProblem, U> onFailed) =>
+        onFailed(Value, Problem);
 }
 ```
 
@@ -561,6 +607,8 @@ public static class TransferServiceCollectionExtensions
 }
 ```
 
+> `services.Configure<TOptions>(IConfiguration)` requires the `Microsoft.Extensions.Options.ConfigurationExtensions` package. For a dependency-free alternative, use the `Action<TOptions>` overload: `services.Configure<TransferOptions>(opts => configuration.GetSection("Transfers").Bind(opts))`.
+
 <!-- File: FeatureLibraries/Transfers/TransferOptions.cs — self-documenting configuration -->
 
 ```csharp
@@ -645,6 +693,8 @@ Strict separation: the domain knows nothing about persistence. Configuration bea
   ```
   **Rationale**: EF Core cannot have a shadow property and a CLR property with the same name. Rename it and use `HasColumnName` to preserve the database convention.
 
+  > ⚠️ **Shadow PKs apply to entities only — NOT to value objects mapped via `ComplexProperty`.** Complex types (e.g., `Money`, `Timestamp`, `BillingPeriod`) have no identity — no key, not even a shadow one. They are structurally part of the owning entity's row. Do NOT add `builder.Property<int>("Id")` or `builder.HasKey("Id")` inside an `IEntityTypeConfiguration<SomeValueObject>` — value objects are not configured with `IEntityTypeConfiguration<T>`, only `ComplexProperty()` lambdas. See the SHOULD section below for ComplexProperty configuration.
+
 - Expose the domain identity as an alternate key or unique index, never making it the primary key. **Rationale**: Alternate keys enable query-by-domain-id on indexed columns while foreign keys reference the surrogate integer, so domain IDs remain opaque to table relationships.
 
   **When to use `HasAlternateKey` vs `HasIndex().IsUnique()`**: Use `HasAlternateKey(e => e.PublicId)` when the domain key is a foreign key *target* in another entity. Use `HasIndex(t => t.Id).IsUnique()` when the domain key is queried but never referenced as a FK — it is lighter-weight and communicates "this is unique but nobody points at it."
@@ -715,6 +765,8 @@ c.Property(x => x.DecimalPlaces)
 //                           ^^^^^^^^^^^^^^ null-conditional: Currency might not be populated yet
   ```
 
+  **Caution — NRT warnings from `default!` on reference-type constructor parameters.** The `private Money() : this(default, default!) { }` pattern suppresses null warnings at the *call site*, but the property initializer `= Currency` (where `Currency` is a non-nullable reference type parameter) may still produce `CS8601`. This is NOT a false positive — the parameterless constructor really does pass null. Resolve with one of: (a) null-coalescing fallback: `= Currency ?? WellKnown.Default`; (b) suppress with `#pragma warning disable CS8601` on the specific init line; or (c) change the parameter to nullable and validate in the init accessor.
+
 - **Place converters in `Data/Conversions/` as standalone files when they contain non-trivial logic.** Trivial converters (simple wrap/unwrap) may be nested inside the entity configuration class or written as inline lambdas. Converters with domain knowledge deserve their own file:
 
   ```csharp
@@ -747,6 +799,14 @@ c.Property(x => x.DecimalPlaces)
 - Nest child-entity configuration classes inside the parent aggregate configuration (e.g., `InvoiceConfiguration.InvoiceLineConfiguration`). **Rationale**: Nesting communicates ownership and discoverability — readers find all configuration for an aggregate in one file.
 - Use `builder.HasDiscriminator<string>().HasValue<TSubtype>()` with TPH inheritance for polymorphic aggregates like `Product → Material | Service`. **Rationale**: TPH avoids complex joins; EF Core materializes the correct subtype from the discriminator column in a single table scan.
 - SHOULD decompose composite value objects into private shadow stand-in properties on the entity when the value object serves as a natural key referenced by child entities. **Rationale**: Shadow properties give full column-level control in the Fluent API while keeping the decomposed value object private to the entity. Example: `InvoiceNumber` decomposed into `private int InvoiceYear` and `private int InvoiceSequence`, with `entity.Ignore(e => e.Number)`, shadow properties mapped via `entity.Property<int>("InvoiceYear")`, and a composite alternate key `entity.HasAlternateKey("InvoiceYear", "InvoiceSequence")`. Child entities reference this via `HasForeignKey("InvoiceNumberYear", "InvoiceNumberSequence").HasPrincipalKey("InvoiceYear", "InvoiceSequence")`.
+  > 🔮 **EF Core 11+**: Keys and indexes can traverse `ComplexProperty` fields directly — decomposition is no longer needed. Instead of shadow stand-ins, reference the ComplexProperty fields in the key directly: `entity.HasAlternateKey(e => new { e.Number.Year, e.Number.Sequence })`. For EF Core 10, the decomposition pattern above remains the correct approach.
+- SHOULD persist discriminated union state machines (from Decision Point 3) as a JSON string column via a custom `ValueConverter` when query-by-state is infrequent. **Rationale**: A single JSON column captures the full variant data (including variant-specific fields like `TrialEndsAt` or `FailedAttempts`) without complex TPH discriminator setup. For high-frequency state queries (e.g., "find all PastDue subscriptions"), MAY alternatively use TPH with a discriminator column — but prefer JSON unless queryability demands it. The converter MUST use `System.Text.Json` and reapply `DateTimeKind.Utc` on any timestamps embedded in the JSON (SQL Server strips `DateTimeKind` on read). Example:
+
+  ```csharp
+  // State serialized to a single nvarchar column; see Decision Point 3 for the variants
+  builder.Property(s => s.State)
+      .HasConversion(new SubscriptionStateConverter());
+  ```
 
 ### MAY
 - Consolidate all configuration inline in `OnModelCreating` (skipping `IEntityTypeConfiguration<T>`) for simple schemas with few entities. **Rationale**: For small projects, the ceremony of separate configuration files outweighs the organizational benefit.
@@ -948,6 +1008,87 @@ public abstract class CreateCompanyTests
 }
 ```
 
+For **feature library tests** (class libraries with no HTTP surface), resolve the public interface directly from a DI container built with real database configuration:
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+
+namespace FeatureTests.Subscriptions;
+
+[TestClass]
+[DoNotParallelize]
+public sealed class CreateSubscriptionTests
+{
+    private static IServiceProvider _services = null!;
+
+    [ClassInitialize(InheritanceBehavior.BeforeEachDerivedClass)]
+    public static Task ClassInitialize(TestContext context)
+    {
+        var services = new ServiceCollection();
+        services.AddBillingSubscriptions(
+            configure: _ => { },
+            dbContextOptionsAction: options =>
+                options.UseSqlServer("Server=.;Database=BillingTests;Trusted_Connection=True;"));
+        _services = services.BuildServiceProvider();
+        return DatabaseFixture.ResetAsync();
+    }
+
+    [TestInitialize]
+    public void TestInitialize()
+    {
+        // Each test gets a fresh scope with a clean ISubscriptionService
+        _scope = _services.CreateScope();
+        _sut = _scope.ServiceProvider.GetRequiredService<ISubscriptionService>();
+    }
+
+    [TestCleanup]
+    public void TestCleanup()
+    {
+        _scope?.Dispose();
+    }
+
+    private IServiceScope? _scope;
+    private ISubscriptionService _sut = null!;
+
+    [TestMethod]
+    public async Task CreateSubscription_WithValidRequest_ReturnsSubscriptionInTrialingState()
+    {
+        var plan = await CreatePlanHelperAsync(_sut, "Pro Plan", "USD", 29.99m);
+        var request = new CreateSubscriptionRequest(
+            CustomerId: Guid.NewGuid(),
+            PlanId: plan.Id,
+            TrialDays: 14);
+
+        var result = await _sut.CreateSubscriptionAsync(request);
+
+        Assert.IsNotNull(result);
+        Assert.AreEqual("Trialing", result.State);
+    }
+
+    [DataTestMethod]
+    [DataRow(0)]     // Empty GUID → should fail construction in SubscriptionId init
+    [DataRow(-1)]    // Negative days → no trial possible
+    public async Task CreateSubscription_WithInvalidInput_ReturnsNull(int trialDays)
+    {
+        var request = new CreateSubscriptionRequest(Guid.Empty, Guid.NewGuid(), trialDays);
+        var result = await _sut.CreateSubscriptionAsync(request);
+        Assert.IsNull(result);
+    }
+
+    private static async Task<PlanSummaryDto> CreatePlanHelperAsync(
+        ISubscriptionService svc, string name, string currency, decimal amount)
+    {
+        var plan = await svc.CreatePlanAsync(new CreatePlanRequest(
+            name, null, amount, currency, 1, "Monthly"));
+        return plan ?? throw new InvalidOperationException("Failed to create test plan");
+    }
+}
+```
+
+> **Feature library tests resolve the public interface directly** — no `WebApplicationFactory`, no `HttpClient`. `CreateScope()` provides a fresh `DbContext` per test. This is the pattern for class library APIs; use `WebApplicationFactory` only for projects with an HTTP surface (Minimal API or Controller projects).
+
 ---
 
 ## Decision Point 11: Converting Between Layers
@@ -1012,6 +1153,7 @@ C# 14 introduces `extension(TargetType)` blocks, which Zoran uses pervasively in
 ### SHOULD
 - SHOULD use factory methods named `New`, `CreateNew`, or `Restore` that return the entity type (possibly nullable). **Rationale**: Explicit factory names with nullable return communicate that construction can fail and avoid throwing from constructors.
 - SHOULD prefer the instance-method calling convention enabled by `extension(TargetType target)` over traditional `this Type` parameter syntax. **Rationale**: The instance-style syntax `book.WithAuthor(a)` reads more naturally than `BookExtensions.WithAuthor(book, a)`.
+- **When to use each form**: Use `extension(TargetType)` (no receiver) for factory methods (`TryCreateNew`, `New`, `Restore`) where no existing instance exists yet — these are called as `Type.Method()`. Use `extension(TargetType receiver)` (with receiver) for transformations on an existing instance — these are called as `receiver.Method()`. The rule: if you need an instance to call it, use a receiver; if it creates a new instance from nothing, omit the receiver.
 
 ### MAY
 - MAY define private helper methods in a separate `extension(AuxiliaryType)` block within the same static class. **Rationale**: Auxiliary extension blocks keep type-specific helpers scoped to the extension class without polluting the target type's namespace.
@@ -1231,7 +1373,7 @@ When you encounter a concept not shown in the examples, derive the correct patte
 1. Declare an `internal record` with a positional primary constructor (use `public record` only in a shared kernel assembly — see Decision Point 6)
 2. Add `{ get; init; }` with ternary + throw for any invariants
 3. Use `nameof()` in all exceptions
-4. If construction can fail for user input, add a `TryCreateNew()` factory returning `T?`
+4. If construction can fail for user input, add a `TryCreate()` factory returning `T?` (use `TryCreateNew()` for aggregate roots — see Decision Point 2)
 5. If the type needs arithmetic or comparison, define operator overloads
 
 **To model a new state machine** (e.g., `OrderStatus`, `PaymentState`):
