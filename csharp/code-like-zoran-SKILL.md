@@ -49,7 +49,13 @@ No `Utils.cs`, no `Helpers.cs`, no `Constants.cs`, no `Enums.cs`. Every concept 
 
 ## Decision Point 1: Creating a Value Object
 
-Value objects wrap primitive types in domain-meaningful types that enforce invariants at construction. Validate in the `init` accessor body using the C# 14 `field` keyword for single-property validation, or use bare `{ get; }` to disable `with` for cross-property validation (see `with`-bypass warning below). Static factory methods provide well-known instances (`Empty`, `UtcNow`, `NewId()`) while keeping the primary constructor internal for deserialization. Never add implicit conversion operators — they hide allocation and bypass validation.
+Value objects wrap primitive types in domain-meaningful types that enforce invariants at construction. Validate in the `init` accessor body using the C# 14 `field` keyword for single-property validation, or use bare `{ get; }` to disable `with` for cross-property validation (see `with`-bypass warning below). Static factory methods provide well-known instances (`UtcNow`, `NewId()`) while keeping the primary constructor internal for deserialization. Never add implicit conversion operators — they hide allocation and bypass validation.
+
+> ⚠️ **C# 14 positional records with explicit property declarations**: The compiler emits CS8907 ("Parameter is unread") when a positional record parameter shares a name with an explicitly declared property that doesn't consume it. Fix by adding `= ParameterName` property initializer — e.g., `public string Code { get; init => ... } = Code;`. Do NOT suppress CS8907 globally; it catches real name-mismatch bugs.
+>
+> ⚠️ **`init` accessor parameter scoping**: In `init => field = Value != default ? Value : throw`, the `Value` identifier refers to the init accessor's implicit `value` parameter, NOT the primary constructor parameter of the same name. The init parameter takes precedence. Use distinct names if this ambiguity matters to readers.
+>
+> ⚠️ **CS9264 and `[field: MaybeNull, AllowNull]`**: When the compiler cannot infer null-resilience for a `field`-backed non-nullable property (common with `private` parameterless constructors for EF Core materialization), add both `[field: MaybeNull, AllowNull]` to the property declaration — e.g., `[field: MaybeNull, AllowNull] public string Code { get; init => ... }`. `MaybeNull` tells the compiler the field may be null when read (suppressing CS9264); `AllowNull` permits null writes. Per the official docs, both are needed — `MaybeNull` alone is incomplete. Do NOT suppress CS9264 globally.
 
 ### MUST
 - MUST declare value objects as `internal record` with a primary constructor wrapping the underlying primitive. **Rationale**: Records deliver structural equality and `{ get; init; }` value semantics out of the box. Value objects are internal to their feature library (see Decision Point 6); value objects shared across multiple features belong in a shared kernel assembly where they may be `public record`.
@@ -59,7 +65,7 @@ Value objects wrap primitive types in domain-meaningful types that enforce invar
 ### SHOULD
 - SHOULD provide a static `NewId()` factory method for ID value objects that wraps `Guid.NewGuid()`. **Rationale**: Centralizes GUID generation; makes intent explicit at the call site.
 - SHOULD prefer `Guid`-wrapped IDs for public-facing identifiers (exposed in DTOs, URLs, or external systems) for their non-guessability and global uniqueness. **Rationale**: `Guid` IDs prevent enumeration attacks and eliminate coordination overhead in distributed systems. MAY use `int` or `long`-wrapped IDs for internal identifiers where sequential ordering or compact storage matters.
-- SHOULD provide a well-known `Empty` sentinel property for ID types that wraps `Guid.Empty`, and well-known static instances for reference-data value objects (`Currency.USD`, `Timestamp.UtcNow`). **Rationale**: Eliminates null checks and provides explicit, searchable representations. For reference-data types, static instances serve as a canonical registry discoverable at the call site.
+- SHOULD provide well-known static instances for reference-data value objects (`Currency.USD`, `Timestamp.UtcNow`). **Rationale**: Static instances serve as a canonical registry discoverable at the call site, eliminating magic strings. ⚠️ Do NOT provide `Empty` sentinels for ID types — Microsoft explicitly advises against sentinel values, and `field`-based validation (`init => field = Value != Guid.Empty ? Value : throw`) blocks `Guid.Empty` anyway. Use `TryCreate` returning `T?` instead; `null` already means "no ID."
 - SHOULD include more than a single field in value objects when additional data naturally clusters with the core value (e.g., `Iso4217Currency` in `Money`). **Rationale**: Co-locating related data prevents primitive obsession and enables domain arithmetic without back-referencing external data.
 - SHOULD bundle domain rules into the value object itself — not in a separate service. Example: `Currency` carries `DecimalPlaces` so `Money` can auto-round without consulting an external configuration. **Rationale**: The value object becomes both identity and policy carrier; callers never need to know which currency has which precision. When reference data comes from an external source or needs dependency injection, MAY use a provider/registry pattern (`IIso4217CurrencyProvider`) instead of embedding all metadata in the value object.
 
@@ -149,6 +155,7 @@ Entity constructors are `internal`, mutable state uses `{ get; private set; }`, 
 ### SHOULD
 - SHOULD provide a static `XxxConstruction` class containing `extension(Xxx)` factory methods for construction and persistence reconstitution. **Rationale**: Separates construction logic from the aggregate itself, keeping the type focused on behavior rather than factory boilerplate.
 - SHOULD name factory methods `TryCreateNew()` (returning `T?` for user-input validation) and `TryRestore()` (returning `T?` for persistence reconstitution). **Rationale**: The naming convention distinguishes fresh creation from database reconstitution; nullable return signals soft failure to the caller.
+  > ⚠️ **`TryRestore` and property accessibility**: Since `XxxConstruction` is a separate static class, it cannot set `private set` properties via object initializers. Pass ALL properties (including mutable ones like `IsActive`, `CanceledAt`) through the entity's primary constructor. The factory calls `new Entity(...)` with all values — never `new Entity(...) { PrivateSetProp = x }`. This keeps properties as `private set` without needing `internal set` workarounds.
 - SHOULD place nested ID record structs inside the aggregate class. **Rationale**: Scopes the ID type to its owning aggregate and avoids namespace pollution.
 - SHOULD gate mutable setters behind a status check (`InEditable<TValue>()`) when some states forbid mutation (e.g., an issued invoice cannot be modified). **Rationale**: Encodes state-machine rules at the property level.
 - SHOULD model entity state as a discriminated union property (see Decision Point 3) rather than an enum or flag, and guard mutable operations with pattern-match checks against the current state. Example: `_state is Editing edit ? PerformEdit(edit) : throw...`.
@@ -625,6 +632,8 @@ public static class TransferServiceCollectionExtensions
 ```
 
 > `services.Configure<TOptions>(IConfiguration)` requires the `Microsoft.Extensions.Options.ConfigurationExtensions` package. For a dependency-free alternative, use the `Action<TOptions>` overload: `services.Configure<TransferOptions>(opts => configuration.GetSection("Transfers").Bind(opts))`.
+>
+> `UseSqlServer()` requires the `Microsoft.EntityFrameworkCore.SqlServer` NuGet package. For provider-agnostic libraries, prefer the `Action<DbContextOptionsBuilder>` overload of `AddTransfers()` so consumers supply their own provider.
 
 <!-- File: FeatureLibraries/Transfers/TransferOptions.cs — self-documenting configuration -->
 
