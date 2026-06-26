@@ -608,28 +608,33 @@ internal sealed class TransferService(
     public async Task<TransferResult?> RequestTransferAsync(
         TransferRequestDto request, CancellationToken ct)
     {
-        // Functional pipeline: Bind chains T? → T? through the nullable monad (see DP5).
-        // Each TryCreate returns null on failure — Bind short-circuits on first null.
-        // Match handles both outcomes in one terminal expression.
-        return await AccountId.TryCreate(request.FromAccountId)
+        // Compose synchronous domain validation with Bind() — short-circuits on first null.
+        var transfer = AccountId.TryCreate(request.FromAccountId)
             .Bind(from => AccountId.TryCreate(request.ToAccountId)
             .Bind(to => Money.TryCreate(request.Amount, request.CurrencyCode)
-            .Bind(amount => Transfer.TryCreateNew(from, to, amount, options.Value.MaxTransferAmount))))
-            .Match(
-                onValue: async transfer =>
-                {
-                    await using var db = await contextFactory.CreateDbContextAsync(ct);
-                    db.Transfers.Add(transfer);
-                    await db.SaveChangesAsync(ct);
-                    return TransferResult.FromTransfer(transfer);
-                },
-                onNull: () => Task.FromResult<TransferResult?>(null));
+            .Bind(amount => Transfer.TryCreateNew(from, to, amount, options.Value.MaxTransferAmount))));
+
+        if (transfer is null) return null;   // Expected domain rejection — caller handles
+
+        // Persistence and I/O are imperative. They are infrastructure, not domain.
+        await using var db = await contextFactory.CreateDbContextAsync(ct);
+        db.Transfers.Add(transfer);
+        await db.SaveChangesAsync(ct);
+        return TransferResult.FromTransfer(transfer);
     }
     // ...
 }
 ```
 
-> The `.Bind().Match()` pipeline replaces imperative null-checking (`if (x is null) return null`). Each `TryCreate` returns `T?`; `Bind` unwraps the value and feeds it to the next step, short-circuiting on the first null. `Match` handles both outcomes in one terminal expression — the happy path persists and returns a DTO; the null path returns `null` to the caller. Nested closures capture intermediate results (`from`, `to`, `amount`) so the final `TryCreateNew` receives all validated values. Result: no `if` chains, no intermediate variables, no early returns — a single expression that either produces a `TransferResult` or `null`.
+> **Default pattern: compose synchronous domain validation with `.Bind()`, guard-clause the result, then imperative `await` for persistence.**
+>
+> - `TryCreate()` + `.Bind()` chains are for **synchronous, expected domain validation**. `null` means "this input was rejected by a business rule" — the caller decides how to present it.
+> - Persistence, I/O, and other infrastructure live after the guard clause. They are **imperative** and **explicit** — database failures are infrastructure exceptions, not domain rejections, and should remain uncaught so they surface through normal error handling.
+> - Do NOT put `SaveChangesAsync` or other I/O inside `.Bind()` or async `.Match()` branches. That mixes domain and infrastructure concerns, requires nested async closures, and obscures the natural boundary where authorisation, transactions, idempotency, auditing, and error handling belong.
+>
+> This hybrid pattern is clearer, easier for LLMs to generate correctly, and creates an obvious seam between "what the domain decided" and "what the system did with that decision."
+>
+> For teams with deep functional-programming fluency, the `Checked<T, TProblem>` monad (DP5) can carry richer error context through the pipeline. For the default case, `T?` + guard clause is sufficient and idiomatic.
 >
 > For simpler cases with 1–2 null-checks, imperative style is acceptable. For 3+ sequential validations, prefer the pipeline.
 
