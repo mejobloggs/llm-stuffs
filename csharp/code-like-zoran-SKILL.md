@@ -453,7 +453,7 @@ Three failure-handling tiers. Hard failures (corrupt input): ternary + throw in 
 - SHOULD use `TryCreateNew()` returning `T?` for user-input scenarios where failure is expected and recoverable. **Rationale**: Nullable return signals "try again" to the caller without throwing exceptions for normal control flow.
 
 ### MAY
-- MAY use the `Checked<T, TProblem>` monad when multiple validation steps must compose without short-circuiting. **Rationale**: `Bind()` accumulates all problems; exceptions abort at the first. Alternative: `Result<T>` or error lists.
+- MAY use the `Checked<T, TProblem>` monad when multiple validation steps must compose and short-circuit on first failure. **Rationale**: `Bind()` propagates the first failure through the chain; the caller receives exactly one problem (the first one encountered) without cascading null checks. For accumulating all errors, use a separate result-list pattern.
 - MAY provide a `Match()` method on the checked monad for explicit success/failure branching at the consumption site. **Rationale**: Forces callers to handle both cases explicitly, preventing null-reference errors.
 - MAY accept a generic `TProblem` type (enum, string, custom record) in the checked monad. **Rationale**: Different domains may need different failure representations (error codes vs. messages vs. structured error objects).
 - MAY define monadic `extension(T?)` blocks with `Bind`, `Map`, `MapValue`, and `Match` for nullable types, both class and struct. **Rationale**: Treating `T?` as a monad enables fluent pipelines on nullable values without repeated null checks.
