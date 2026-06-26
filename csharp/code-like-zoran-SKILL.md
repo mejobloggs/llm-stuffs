@@ -51,6 +51,38 @@ No `Utils.cs`, no `Helpers.cs`, no `Constants.cs`, no `Enums.cs`. Every concept 
 
 ---
 
+## Anti-Patterns — Common Mistakes That Break the Style
+
+These patterns explicitly violate Zoran's conventions. If you generate any of these, stop and re-evaluate.
+
+| Anti-Pattern | Fix |
+|---|---|
+| `{ get; set; }` on domain properties | `{ get; init; }` for immutable, `{ get; private set; }` for controlled mutation |
+| `(Guid accountId, Guid userId)` as a method signature | `(AccountId accountId, EmployeeId userId)` — wrap every primitive |
+| `bool IsApproved` or `enum Status` for state | Discriminated union: `abstract record Approval; sealed record Pending : Approval;` |
+| `[Required] public string Name` on a domain model | `{ get; init; }` with ternary + throw validation |
+| `[Key]` or `[Column]` attributes on domain classes | Fluent API `IEntityTypeConfiguration<T>` in `Data/EntityConfiguration/` |
+| `DbSet<T>.Find(id)` | `FirstOrDefaultAsync(e => e.PublicId == domainKey)` |
+| Wrapping `DbContext` in `IRepository<TAggregate, TKey>` | Inject `IDbContextFactory<T>` and create short-lived contexts with `await using` |
+| `OwnsOne` / `OwnsMany` for value objects | `ComplexProperty` (EF Core 8+) — flattens into owning table, no JOINs |
+| Forgetting parameterless constructor on value objects used in `ComplexProperty` | Add `private Money() : this(default, default!) { }` — required for EF Core materialization |
+| `ControllerBase` subclass | `public static class Xxx { ... }` with static Minimal API methods |
+| `// Arrange` / `// Act` / `// Assert` comments in tests | Whitespace grouping; self-documenting method names |
+| `IServiceProvider.GetService<T>()` inside a class | Constructor or parameter injection |
+| `AutoMapper` or `.Map<T>()` for layer conversion | Hand-written extension method: `extension(Source) { public Target ToResponseDto() => ... }` |
+| `Utils.cs`, `Helpers.cs`, `Constants.cs`, `Enums.cs` | One concept, one file. If an enum is referenced from multiple files, it gets its own file. An enum used exclusively within a single class may remain colocated. |
+| `public` constructor on a domain entity | `internal` constructor + `static class XxxConstruction` with `extension(Xxx)` factories |
+| `bool IsValid { get; }` or `void Validate()` | Validation in `{ get; init; }` at construction time — invalid objects never exist |
+| FluentAssertions / Shouldly / Moq / NSubstitute | Raw MSTest `Assert.*` only. Zero mocking. |
+| `Newtonsoft.Json` / `JsonConvert` | `System.Text.Json` — built into .NET, zero dependencies. |
+| `string` for identifiers (`string handle`, `string currencyCode`) | Dedicated type: `CompanyHandle`, `Currency`, `Iso4217Currency` |
+| Shadow PK named `"Id"` when domain model already has an `Id` property | Rename shadow PK to `"Key"` with `HasColumnName("Id")` |
+| `DateTimeKind` stripped silently by SQL Server | Reapply `DateTime.SpecifyKind(dt, DateTimeKind.Utc)` in value converter |
+| Assuming `ComplexProperty` sub-objects populate in order | Null-conditional guard: `Currency?.DecimalPlaces ?? 0` |
+| `record with { Prop = badValue }` silently bypassing property initializer validation | Move validation to `init => field = value ?? throw` (single-property) or remove `init` entirely for cross-property checks (see DP1) |
+
+---
+
 > **Companion types**: Code examples reference types not defined in this file (`Currency`, `InvoiceStatus`, `AppDbContext`, `IncompleteApproval`, `ApprovedTransfer`, `ICompletedApproval`, `IIncompleteApproval`, etc.). These follow the same conventions as the types shown here; generate them accordingly.
 
 ## Decision Point 1: Creating a Value Object
@@ -581,7 +613,7 @@ A feature ships as a self-contained class library with one or two public interfa
 - MAY provide a separate `.Abstractions` project containing only interfaces and DTOs when the feature is consumed across process boundaries or by multiple alternative implementations. **Rationale**: An abstractions package lets consumers reference contracts without pulling in the implementation's full transitive dependency graph.
 - MAY define a `FeatureXxxOptions` record with a static `Default` property and reasonable initial values. **Rationale**: A default instance enables zero-configuration `AddTransfers()` calls while the Options pattern still allows override from `appsettings.json` or environment variables.
 
-<!-- File: FeatureLibraries/Transfers/IMoneyTransferService.cs — the single public entry point -->
+**File: `FeatureLibraries/Transfers/IMoneyTransferService.cs`** — the single public entry point
 
 ```csharp
 // The ONLY public types a consumer of this feature ever sees:
@@ -598,7 +630,7 @@ public interface IMoneyTransferService
 }
 ```
 
-<!-- File: FeatureLibraries/Transfers/TransferService.cs — internal implementation -->
+**File: `FeatureLibraries/Transfers/TransferService.cs`** — internal implementation
 
 ```csharp
 internal sealed class TransferService(
@@ -638,7 +670,7 @@ internal sealed class TransferService(
 >
 > For simpler cases with 1–2 null-checks, imperative style is acceptable. For 3+ sequential validations, prefer the pipeline.
 
-<!-- File: FeatureLibraries/Transfers/ServiceCollectionExtensions.cs — one-call registration -->
+**File: `FeatureLibraries/Transfers/ServiceCollectionExtensions.cs`** — one-call registration
 
 ```csharp
 namespace Microsoft.Extensions.DependencyInjection;
@@ -663,7 +695,7 @@ public static class TransferServiceCollectionExtensions
 >
 > `UseSqlServer()` requires the `Microsoft.EntityFrameworkCore.SqlServer` NuGet package. For provider-agnostic libraries, prefer the `Action<DbContextOptionsBuilder>` overload of `AddTransfers()` so consumers supply their own provider.
 
-<!-- File: FeatureLibraries/Transfers/TransferOptions.cs — self-documenting configuration -->
+**File: `FeatureLibraries/Transfers/TransferOptions.cs`** — self-documenting configuration
 
 ```csharp
 public record TransferOptions
@@ -675,7 +707,7 @@ public record TransferOptions
 }
 ```
 
-<!-- File: Consumer/Program.cs — integrating the feature, with optional HTTP exposure -->
+**File: `Consumer/Program.cs`** — integrating the feature, with optional HTTP exposure
 
 ```csharp
 // Consumer adds the entire feature with one line
@@ -1384,38 +1416,6 @@ app.Run();
 
 namespace Tbd.WebApi { public partial class Program { } }
 ```
-
----
-
-## Anti-Pattern Appendix — Common Mistakes That Break the Style
-
-These patterns explicitly violate Zoran's conventions. If you generate any of these, stop and re-evaluate.
-
-| Anti-Pattern | Fix |
-|---|---|
-| `{ get; set; }` on domain properties | `{ get; init; }` for immutable, `{ get; private set; }` for controlled mutation |
-| `(Guid accountId, Guid userId)` as a method signature | `(AccountId accountId, EmployeeId userId)` — wrap every primitive |
-| `bool IsApproved` or `enum Status` for state | Discriminated union: `abstract record Approval; sealed record Pending : Approval;` |
-| `[Required] public string Name` on a domain model | `{ get; init; }` with ternary + throw validation |
-| `[Key]` or `[Column]` attributes on domain classes | Fluent API `IEntityTypeConfiguration<T>` in `Data/EntityConfiguration/` |
-| `DbSet<T>.Find(id)` | `FirstOrDefaultAsync(e => e.PublicId == domainKey)` |
-| Wrapping `DbContext` in `IRepository<TAggregate, TKey>` | Inject `IDbContextFactory<T>` and create short-lived contexts with `await using` |
-| `OwnsOne` / `OwnsMany` for value objects | `ComplexProperty` (EF Core 8+) — flattens into owning table, no JOINs |
-| Forgetting parameterless constructor on value objects used in `ComplexProperty` | Add `private Money() : this(default, default!) { }` — required for EF Core materialization |
-| `ControllerBase` subclass | `public static class Xxx { ... }` with static Minimal API methods |
-| `// Arrange` / `// Act` / `// Assert` comments in tests | Whitespace grouping; self-documenting method names |
-| `IServiceProvider.GetService<T>()` inside a class | Constructor or parameter injection |
-| `AutoMapper` or `.Map<T>()` for layer conversion | Hand-written extension method: `extension(Source) { public Target ToResponseDto() => ... }` |
-| `Utils.cs`, `Helpers.cs`, `Constants.cs`, `Enums.cs` | One concept, one file. If an enum is referenced from multiple files, it gets its own file. An enum used exclusively within a single class may remain colocated.
-| `public` constructor on a domain entity | `internal` constructor + `static class XxxConstruction` with `extension(Xxx)` factories |
-| `bool IsValid { get; }` or `void Validate()` | Validation in `{ get; init; }` at construction time — invalid objects never exist |
-| FluentAssertions / Shouldly / Moq / NSubstitute | Raw MSTest `Assert.*` only. Zero mocking. |
-| `Newtonsoft.Json` / `JsonConvert` | `System.Text.Json` — built into .NET, zero dependencies. |
-| `string` for identifiers (`string handle`, `string currencyCode`) | Dedicated type: `CompanyHandle`, `Currency`, `Iso4217Currency` |
-| Shadow PK named `"Id"` when domain model already has an `Id` property | Rename shadow PK to `"Key"` with `HasColumnName("Id")` |
-| `DateTimeKind` stripped silently by SQL Server | Reapply `DateTime.SpecifyKind(dt, DateTimeKind.Utc)` in value converter |
-| Assuming `ComplexProperty` sub-objects populate in order | Null-conditional guard: `Currency?.DecimalPlaces ?? 0` |
-| `record with { Prop = badValue }` silently bypassing property initializer validation | Move validation to `init => field = value ?? throw` (single-property) or remove `init` entirely for cross-property checks (see DP1) |
 
 ---
 
