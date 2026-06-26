@@ -9,7 +9,13 @@ You are generating C# code in the style of Zoran Horvat — functional domain mo
 ---
 
 **Target**: Domain-heavy line-of-business applications where business rule correctness matters more than development velocity.
-**Prerequisites**: .NET 10+, C# 14+, EF Core 10+. This skill uses C# 14 `extension` blocks, primary constructors, and EF Core `ComplexProperty` throughout.
+
+**Prerequisites** — this skill is **strictly scoped** to:
+- **.NET 10** (LTS, released November 2025, supported until November 2028) — [official docs](https://learn.microsoft.com/en-us/dotnet/core/whats-new/dotnet-10/overview)
+- **C# 14** — [official docs](https://learn.microsoft.com/en-us/dotnet/csharp/whats-new/csharp-14)
+- **EF Core 10** — [official docs](https://learn.microsoft.com/en-us/ef/core/what-is-new/ef-core-10.0/whatsnew)
+
+This skill uses C# 14 `extension` blocks, the `field` keyword, null-conditional assignment, implicit span conversions, and EF Core `ComplexProperty` throughout. C# 12 primary constructors are also used where they reduce boilerplate.
 
 > ⚠️ **C# 14 `extension` blocks — READ BEFORE DP2**: Syntax `extension(TargetType)` defines static extension members (called as `Type.Method()`). Add a receiver name, e.g. `extension(TargetType receiver)`, for instance-like members (called as `receiver.Method()`). Both forms live inside a `public static class XxxRole { ... }`. The examples in DPs 2–5 use this syntax extensively; see Decision Point 12 for the full specification. **If a call like `Plan.TryCreateNew(...)` or `estimate.Add(other)` looks unfamiliar, flip to DP12 now.**
 
@@ -146,7 +152,7 @@ Entity constructors are `internal`, mutable state uses `{ get; private set; }`, 
 - SHOULD place nested ID record structs inside the aggregate class. **Rationale**: Scopes the ID type to its owning aggregate and avoids namespace pollution.
 - SHOULD gate mutable setters behind a status check (`InEditable<TValue>()`) when some states forbid mutation (e.g., an issued invoice cannot be modified). **Rationale**: Encodes state-machine rules at the property level.
 - SHOULD model entity state as a discriminated union property (see Decision Point 3) rather than an enum or flag, and guard mutable operations with pattern-match checks against the current state. Example: `_state is Editing edit ? PerformEdit(edit) : throw...`.
-- SHOULD use the `field` keyword (C# 13+) in `set` and `init` accessors when validation logic or mutation gating needs access to the backing value. **Rationale**: Eliminates the boilerplate of declaring a separate private backing field when all the accessor does is validate-then-assign. Example: `set => field = InEditable(value);` or `init => field = value.All(...) ? value : throw ...`.
+- SHOULD use the `field` keyword (C# 14) in `set` and `init` accessors when validation logic or mutation gating needs access to the backing value. **Rationale**: Eliminates the boilerplate of declaring a separate private backing field when all the accessor does is validate-then-assign. Example: `set => field = InEditable(value);` or `init => field = value.All(...) ? value : throw ...`.
 - SHOULD use `private init` for identity properties that must never change after construction (e.g., `Ordinal`, `Id` on child entities). **Rationale**: `private init` allows setting during construction or via a `With*` factory within the same type, but blocks all external mutation — the compiler enforces that the property is set exactly once.
 
 ### MAY
@@ -204,7 +210,7 @@ internal class Invoice(
     public string CustomerName
     {
         get;
-        set => InEditable(AsValidCustomerName(value));      // Gate: rejected if not Editing
+        set => field = InEditable(AsValidCustomerName(value));      // Gate: rejected if not Editing
     } = AsValidCustomerName(customerName);
 
     public Currency Currency { get; set => field = InEditable(value); } = currency;
@@ -356,18 +362,6 @@ internal class PendingTransfer : Transfer
 }
 ```
 
-> 🔮 **C# 15 / .NET 11+**: Native `union` types supersede the `abstract record` + `sealed record` pattern. The native syntax provides compiler-enforced exhaustiveness (no `_` discard required), a closed hierarchy (no external derivation possible), and first-class IDE support. Prefer this when targeting .NET 11+:
-> ```csharp
-> // C# 15+ — native union replaces the abstract record pattern above
-> public record class Pending();
-> public record class PartlyApproved(EmployeeId Approver);
-> public record class FullyApproved(EmployeeId First, EmployeeId Second);
-> public record class Rejected(EmployeeId Rejector);
-> 
-> public union FourEyesApproval(Pending, PartlyApproved, FullyApproved, Rejected);
-> ```
-> For .NET 10 / C# 14, the `abstract record` + `sealed record` pattern shown above remains the recommended approach.
-
 ---
 
 ## Decision Point 4: Using Property Patterns & Pattern Matching
@@ -436,10 +430,10 @@ static class ComplexDomainDemo
 
 ## Decision Point 5: Handling Validation / Construction Failure
 
-Three failure-handling tiers. Hard failures (corrupt input): ternary + throw in property initializers — no recovery. Soft failures (invalid user input): `TryCreateNew()` returning `T?`. Multi-step chains where all errors must accumulate: `Checked<T, TProblem>` monad (see MAY below).
+Three failure-handling tiers. Hard failures (corrupt input): ternary + throw in `init` accessor bodies — no recovery. Soft failures (invalid user input): `TryCreateNew()` returning `T?`. Multi-step chains where all errors must accumulate: `Checked<T, TProblem>` monad (see MAY below).
 
 ### MUST
-- MUST use ternary + throw in property initializers for invariants that are never expected to fail under correct system operation (e.g., non-empty GUID, non-negative amount). **Rationale**: Programming errors; the stack trace pinpoints the bug.
+- MUST use ternary + throw in `init` accessor bodies for invariants that are never expected to fail under correct system operation (e.g., non-empty GUID, non-negative amount). Prefer the C# 14 `field` keyword (`init => field = value ?? throw`) as shown in Decision Point 1 — it fires for both `new` and `with`. **Rationale**: Programming errors; the stack trace pinpoints the bug.
 - MUST NOT define `bool IsValid { get; }` properties or `void Validate()` methods called after construction on domain objects. **Rationale**: Post-construction validation creates a window where an invalid object exists. (UI view models may expose `IsValid`; this rule is for domain objects.)
 
 ### SHOULD
@@ -483,7 +477,7 @@ sealed record Failed<T, TProblem>(T Value, TProblem Problem) : Checked<T, TProbl
     public override Checked<T, TProblem> Bind(Func<T, Checked<T, TProblem>> func) => this;
 
     public override Checked<U, TProblem> Bind<U>(Func<T, Checked<U, TProblem>> func, U orElse) =>
-        Checked<U, TProblem>.Unit(orElse);
+        Checked<U, TProblem>.Failed(orElse, Problem);
 
     public override Checked<U, TProblem> Map<U>(Func<T, U> func) =>
         Checked<U, TProblem>.Failed(func(Value), Problem);
@@ -517,10 +511,10 @@ static class NullableMonad
             value is null ? onNull() : onValue(value);
     }
 
-    extension<T>(Nullable<T> value) where T : struct
+    extension<T>(T? value) where T : struct
     {
-        public Nullable<U> Bind<U>(Func<T, Nullable<U>> func) where U : struct =>
-            value.HasValue ? func(value.Value) : new Nullable<U>();
+        public U? Bind<U>(Func<T, U?> func) where U : struct =>
+            value.HasValue ? func(value.Value) : null;
 
         public U Match<U>(Func<T, U> onValue, Func<U> onNull) =>
             value.HasValue ? onValue(value.Value) : onNull();
@@ -783,9 +777,8 @@ c.Property(x => x.DecimalPlaces)
 - **Use null-conditional guards in value-object init accessors** when the object is used as a `ComplexProperty`. EF Core materializes sub-properties in an undefined order — `Currency` may still be null when `Money.Amount`'s init runs:
 
   ```csharp
-  public decimal Amount { get; init; }
-= Math.Round(Amount, Currency?.DecimalPlaces ?? 0);
-//                           ^^^^^^^^^^^^^^ null-conditional: Currency might not be populated yet
+  public decimal Amount { get; init; } = Math.Round(Amount, Currency?.DecimalPlaces ?? 0);
+  //                                    ^^^^^^^^^^^^^^ null-conditional: Currency might not be populated yet
   ```
 
   **Caution — NRT warnings from `default!` on reference-type constructor parameters.** The `private Money() : this(default, default!) { }` pattern suppresses null warnings at the *call site*, but the property initializer `= Currency` (where `Currency` is a non-nullable reference type parameter) may still produce `CS8601`. This is NOT a false positive — the parameterless constructor really does pass null. Resolve with one of: (a) null-coalescing fallback: `= Currency ?? WellKnown.Default`; (b) suppress with `#pragma warning disable CS8601` on the specific init line; or (c) change the parameter to nullable and validate in the init accessor.
@@ -822,8 +815,7 @@ c.Property(x => x.DecimalPlaces)
 - Nest child-entity configuration classes inside the parent aggregate configuration (e.g., `InvoiceConfiguration.InvoiceLineConfiguration`). **Rationale**: Nesting communicates ownership and discoverability — readers find all configuration for an aggregate in one file.
 - Use `builder.HasDiscriminator<string>().HasValue<TSubtype>()` with TPH inheritance for polymorphic aggregates like `Product → Material | Service`. **Rationale**: TPH avoids complex joins; EF Core materializes the correct subtype from the discriminator column in a single table scan.
 - SHOULD decompose composite value objects into private shadow stand-in properties on the entity when the value object serves as a natural key referenced by child entities. **Rationale**: Shadow properties give full column-level control in the Fluent API while keeping the decomposed value object private to the entity. Example: `InvoiceNumber` decomposed into `private int InvoiceYear` and `private int InvoiceSequence`, with `entity.Ignore(e => e.Number)`, shadow properties mapped via `entity.Property<int>("InvoiceYear")`, and a composite alternate key `entity.HasAlternateKey("InvoiceYear", "InvoiceSequence")`. Child entities reference this via `HasForeignKey("InvoiceNumberYear", "InvoiceNumberSequence").HasPrincipalKey("InvoiceYear", "InvoiceSequence")`.
-  > 🔮 **EF Core 11+**: Keys and indexes can traverse `ComplexProperty` fields directly — decomposition is no longer needed. Instead of shadow stand-ins, reference the ComplexProperty fields in the key directly: `entity.HasAlternateKey(e => new { e.Number.Year, e.Number.Sequence })`. For EF Core 10, the decomposition pattern above remains the correct approach.
-- SHOULD persist discriminated union state machines (from Decision Point 3) as a JSON string column via a custom `ValueConverter` when query-by-state is infrequent. **Rationale**: A single JSON column captures the full variant data (including variant-specific fields like `TrialEndsAt` or `FailedAttempts`) without complex TPH discriminator setup. For high-frequency state queries (e.g., "find all PastDue subscriptions"), MAY alternatively use TPH with a discriminator column — but prefer JSON unless queryability demands it. The converter MUST use `System.Text.Json` and reapply `DateTimeKind.Utc` on any timestamps embedded in the JSON (SQL Server strips `DateTimeKind` on read). Example:
+- SHOULD persist discriminated union state machines (from Decision Point 3) as a JSON column via `ComplexProperty` + `ToJson()` in EF Core 10, or via a custom `ValueConverter` for `nvarchar` columns when query-by-state is infrequent. **Rationale**: `ComplexProperty(b => b.State, c => c.ToJson())` uses the native `json` type on SQL Server 2025/Azure SQL, enables `ExecuteUpdateAsync` on JSON properties, and benefits from EF Core 10's improved JSON materialization. A `ValueConverter` to `nvarchar` remains valid for broader SQL Server compatibility. For high-frequency state queries (e.g., "find all PastDue subscriptions"), MAY alternatively use TPH with a discriminator column — but prefer JSON unless queryability demands it. The converter MUST use `System.Text.Json` and reapply `DateTimeKind.Utc` on any timestamps embedded in the JSON (SQL Server strips `DateTimeKind` on read). Example:
 
   ```csharp
   // State serialized to a single nvarchar column; see Decision Point 3 for the variants
@@ -835,6 +827,7 @@ c.Property(x => x.DecimalPlaces)
 - Consolidate all configuration inline in `OnModelCreating` (skipping `IEntityTypeConfiguration<T>`) for simple schemas with few entities. **Rationale**: For small projects, the ceremony of separate configuration files outweighs the organizational benefit.
 - Hide EF Core navigation properties from the domain model with `builder.Ignore()` and map relationships through string-based overloads like `builder.HasMany<InvoiceLine>("LinesCollection")`. **Rationale**: Hiding navigations keeps domain classes free of EF concerns while `builder.Navigation("LinesCollection")` still enables eager loading in queries.
 - Omit explicit `IsRequired()` calls when using C# nullable reference types — the NRT annotations (`string` vs `string?`) already signal required vs optional to EF Core conventions. **Rationale**: NRT-driven convention is the modern, less verbose approach.
+- Use EF Core 10 **named query filters** when multiple global filters must be independently toggled (e.g., soft-delete + multi-tenancy): `builder.HasQueryFilter("SoftDelete", b => !b.IsDeleted).HasQueryFilter("Tenant", b => b.TenantId == _tenantId)`. Disable selectively: `db.Blogs.IgnoreQueryFilters(["SoftDelete"])`. **Rationale**: Named filters replace the single-filter-per-entity limitation of EF Core 9 and earlier, enabling selective filter bypass without losing other filters.
 
 ```csharp
 public class ProductConfiguration : IEntityTypeConfiguration<Product>
@@ -922,6 +915,9 @@ Handler methods receive `IDbContextFactory<T>` via DI, then create a short-lived
 
 ### MAY
 - For large projects with many query paths, extract complex read queries into dedicated query classes in `Data/Queries/` that take `DbContext` as a dependency. **Rationale**: Prevents the `DbContext` class itself from accumulating query logic.
+- Use `.NET 10` `LeftJoin` and `RightJoin` LINQ operators for outer-join queries — `db.Students.LeftJoin(db.Departments, s => s.DepartmentId, d => d.Id, (s, d) => new { s.Name, Dept = d.Name ?? "[NONE]" })`. **Rationale**: .NET 10 first-class `LeftJoin`/`RightJoin` replaces the old `GroupJoin` + `SelectMany` + `DefaultIfEmpty` ceremony; EF Core 10 translates these directly to SQL `LEFT JOIN` / `RIGHT JOIN`.
+- Use `ExecuteUpdateAsync` with a regular (non-expression) lambda when building dynamic update setters — `await db.Blogs.ExecuteUpdateAsync(s => { s.SetProperty(b => b.Views, 8); if (nameChanged) s.SetProperty(b => b.Name, "foo"); })`. **Rationale**: EF Core 10 accepts a statement lambda, eliminating the expression-tree construction ceremony required in EF Core 9 and earlier.
+- Use EF Core 10 `ExecuteUpdateAsync` to bulk-update properties inside JSON columns mapped via `ComplexProperty` + `ToJson()` — `await db.Blogs.ExecuteUpdateAsync(s => s.SetProperty(b => b.Details.Views, b => b.Details.Views + 1))`. **Rationale**: EF Core 10 translates JSON property updates to efficient SQL (e.g., `JSON_MODIFY` or the new `modify()` method on SQL Server 2025 `json` type).
 
 ---
 
@@ -1307,6 +1303,7 @@ DI follows a minimal recipe: register an `IDbContextFactory<T>` and nothing else
 - Enable `Nullable` and `ImplicitUsings` in every `.csproj`. **Rationale**: Nullable guards force explicit null-handling decisions; implicit usings eliminate boilerplate `using` lines for `System`, `System.Linq`, etc.
 - Use only parameter injection in consuming classes — never pass `IServiceProvider` into a class. **Rationale**: Parameter injection makes dependencies explicit in the method signature; service location hides them.
 - Use `System.Text.Json` exclusively for all JSON serialization — never add a `Newtonsoft.Json` package reference or use `JsonConvert`. **Rationale**: `System.Text.Json` is built into .NET, requires zero external dependencies, and has been the standard since .NET Core 3.0.
+- Leverage .NET 10 `JsonSerializerOptions` defaults: `AllowDuplicateKeys` now defaults to `false` (rejecting duplicate JSON keys), and the new `JsonSerializerOptions.Strict` property enables maximum validation for API boundaries. **Rationale**: Strict defaults catch malformed input at deserialization time rather than letting invalid data reach domain logic.
 
 ### SHOULD
 - Use primary constructors for DI-injected classes whose parameters map directly to stored fields. **Rationale**: Removes the ceremony of private readonly field declarations and assignment-only constructor bodies.
@@ -1381,6 +1378,7 @@ These patterns explicitly violate Zoran's conventions. If you generate any of th
 | Shadow PK named `"Id"` when domain model already has an `Id` property | Rename shadow PK to `"Key"` with `HasColumnName("Id")` |
 | `DateTimeKind` stripped silently by SQL Server | Reapply `DateTime.SpecifyKind(dt, DateTimeKind.Utc)` in value converter |
 | Assuming `ComplexProperty` sub-objects populate in order | Null-conditional guard: `Currency?.DecimalPlaces ?? 0` |
+| `record with { Prop = badValue }` silently bypassing property initializer validation | Move validation to `init => field = value ?? throw` (single-property) or remove `init` entirely for cross-property checks (see DP1) |
 
 ---
 
@@ -1390,6 +1388,8 @@ These patterns explicitly violate Zoran's conventions. If you generate any of th
 - **Copy-constructor pattern**: Allocates a new object per mutation. Acceptable for domain operations (infrequent); avoid in hot paths. See Decision Point 13.
 - **`UpdateImmutable<T>()`**: Reflection-based collection alignment. Acceptable for small collections; write explicit per-aggregate sync for large graphs. See Decision Point 13.
 - **`{ get; init; }` with ternary + throw**: Executes validation once at construction — zero ongoing cost. See Decision Point 1.
+- **EF Core 10 split-query ordering**: EF Core 10 fixes split-query ordering inconsistencies that could return incorrect data under `Take()`/`Skip()` — no code changes needed; just upgrade. See Decision Point 9.
+- **EF Core 10 parameterized-collection padding**: EF Core 10 defaults to multi-parameter translation for `Contains()` on collections, with list padding to reduce SQL plan cache bloat. See Decision Point 9.
 
 ## Extrapolating to New Domains
 
