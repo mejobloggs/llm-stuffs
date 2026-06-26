@@ -6,6 +6,12 @@ description: Generate C# code in Zoran Horvat's style
 
 You are generating C# code in the style of Zoran Horvat — functional domain modeling, discriminated unions, value objects, immutability, explicit domain boundaries.
 
+His guidelines: making illegal states unrepresentable (rich domain types over
+  primitives/nulls), pushing nulls to the boundary (Option-like patterns, no
+  null returns mid-domain), exhaustive pattern matching / switch expressions
+  over if-chains, immutability by default, polymorphism over conditionals, and
+  functional pipelines (LINQ-style transformation chains)
+
 ---
 
 **Target**: Domain-heavy line-of-business applications where business rule correctness matters more than development velocity.
@@ -470,7 +476,7 @@ sealed record Passed<T, TProblem>(T Value) : Checked<T, TProblem>(Value)
         func(Value);
 
     public override Checked<U, TProblem> Bind<U>(Func<T, Checked<U, TProblem>> func, U orElse) =>
-        func(Value) is Failed<U, TProblem> ? Checked<U, TProblem>.Unit(orElse) : func(Value);
+        func(Value);
 
     public override Checked<U, TProblem> Map<U>(Func<T, U> func) =>
         Checked<U, TProblem>.Unit(func(Value));
@@ -487,7 +493,7 @@ sealed record Failed<T, TProblem>(T Value, TProblem Problem) : Checked<T, TProbl
         Checked<U, TProblem>.Failed(orElse, Problem);
 
     public override Checked<U, TProblem> Map<U>(Func<T, U> func) =>
-        Checked<U, TProblem>.Failed(func(Value), Problem);
+        Checked<U, TProblem>.Failed(default!, Problem);
 
     public override U Match<U>(Func<T, U> onPassed, Func<T, TProblem, U> onFailed) =>
         onFailed(Value, Problem);
@@ -514,6 +520,12 @@ static class NullableMonad
         public U? Bind<U>(Func<T, U?> func) where U : class =>
             value is null ? null : func(value);
 
+        public U? Map<U>(Func<T, U> func) where U : class =>
+            value is null ? null : func(value);
+
+        public Nullable<U> MapValue<U>(Func<T, U> func) where U : struct =>
+            value is null ? new Nullable<U>() : new Nullable<U>(func(value));
+
         public U Match<U>(Func<T, U> onValue, Func<U> onNull) =>
             value is null ? onNull() : onValue(value);
     }
@@ -521,6 +533,12 @@ static class NullableMonad
     extension<T>(T? value) where T : struct
     {
         public U? Bind<U>(Func<T, U?> func) where U : struct =>
+            value.HasValue ? func(value.Value) : null;
+
+        public Nullable<U> Map<U>(Func<T, U> func) where U : struct =>
+            value.HasValue ? new Nullable<U>(func(value.Value)) : new Nullable<U>();
+
+        public U? MapRef<U>(Func<T, U> func) where U : class =>
             value.HasValue ? func(value.Value) : null;
 
         public U Match<U>(Func<T, U> onValue, Func<U> onNull) =>
@@ -590,25 +608,30 @@ internal sealed class TransferService(
     public async Task<TransferResult?> RequestTransferAsync(
         TransferRequestDto request, CancellationToken ct)
     {
-        // Validate at the public boundary — convert DTOs to domain types
-        var from = AccountId.TryCreate(request.FromAccountId);
-        var to = AccountId.TryCreate(request.ToAccountId);
-        var amount = Money.TryCreate(request.Amount, request.CurrencyCode);
-
-        if (from is null || to is null || amount is null)
-            return null;   // Soft failure — caller decides how to present the error
-
-        var transfer = Transfer.TryCreateNew(from, to, amount, options.Value.MaxTransferAmount);
-        if (transfer is null) return null;
-
-        await using var db = await contextFactory.CreateDbContextAsync(ct);
-        db.Transfers.Add(transfer);
-        await db.SaveChangesAsync(ct);
-        return TransferResult.FromTransfer(transfer);
+        // Functional pipeline: Bind chains T? → T? through the nullable monad (see DP5).
+        // Each TryCreate returns null on failure — Bind short-circuits on first null.
+        // Match handles both outcomes in one terminal expression.
+        return await AccountId.TryCreate(request.FromAccountId)
+            .Bind(from => AccountId.TryCreate(request.ToAccountId)
+            .Bind(to => Money.TryCreate(request.Amount, request.CurrencyCode)
+            .Bind(amount => Transfer.TryCreateNew(from, to, amount, options.Value.MaxTransferAmount))))
+            .Match(
+                onValue: async transfer =>
+                {
+                    await using var db = await contextFactory.CreateDbContextAsync(ct);
+                    db.Transfers.Add(transfer);
+                    await db.SaveChangesAsync(ct);
+                    return TransferResult.FromTransfer(transfer);
+                },
+                onNull: () => Task.FromResult<TransferResult?>(null));
     }
     // ...
 }
 ```
+
+> The `.Bind().Match()` pipeline replaces imperative null-checking (`if (x is null) return null`). Each `TryCreate` returns `T?`; `Bind` unwraps the value and feeds it to the next step, short-circuiting on the first null. `Match` handles both outcomes in one terminal expression — the happy path persists and returns a DTO; the null path returns `null` to the caller. Nested closures capture intermediate results (`from`, `to`, `amount`) so the final `TryCreateNew` receives all validated values. Result: no `if` chains, no intermediate variables, no early returns — a single expression that either produces a `TransferResult` or `null`.
+>
+> For simpler cases with 1–2 null-checks, imperative style is acceptable. For 3+ sequential validations, prefer the pipeline.
 
 <!-- File: FeatureLibraries/Transfers/ServiceCollectionExtensions.cs — one-call registration -->
 
