@@ -43,11 +43,11 @@ No `Utils.cs`, no `Helpers.cs`, no `Constants.cs`, no `Enums.cs`. Every concept 
 
 ## Decision Point 1: Creating a Value Object
 
-Value objects wrap primitive types in domain-meaningful types that enforce invariants at construction. Use `{ get; init; }` with ternary + throw for fail-fast validation. Static factory methods provide well-known instances (`Empty`, `UtcNow`, `NewId()`) while keeping the primary constructor internal for deserialization. Never add implicit conversion operators — they hide allocation and bypass validation.
+Value objects wrap primitive types in domain-meaningful types that enforce invariants at construction. Validate in the `init` accessor body using the C# 14 `field` keyword for single-property validation, or use bare `{ get; }` to disable `with` for cross-property validation (see `with`-bypass warning below). Static factory methods provide well-known instances (`Empty`, `UtcNow`, `NewId()`) while keeping the primary constructor internal for deserialization. Never add implicit conversion operators — they hide allocation and bypass validation.
 
 ### MUST
 - MUST declare value objects as `internal record` with a primary constructor wrapping the underlying primitive. **Rationale**: Records deliver structural equality and `{ get; init; }` value semantics out of the box. Value objects are internal to their feature library (see Decision Point 6); value objects shared across multiple features belong in a shared kernel assembly where they may be `public record`.
-- MUST validate in the `{ get; init; }` property initializer using ternary + throw, never in a separate `Validate()` method or `IsValid` property on domain objects. **Rationale**: The object must never exist in an invalid state; construction-time failure is fail-fast. (UI view models may expose `IsValid`; this rule is for domain objects.)
+- MUST validate in the `init` accessor body using ternary + throw, never in a separate `Validate()` method or `IsValid` property on domain objects. **Rationale**: The object must never exist in an invalid state; construction-time failure is fail-fast. Prefer the C# 14 `field` keyword (`init => field = value ?? throw ...`) — this fires for both `new` and `with`. The `{ get; init; } = value ?? throw` property initializer pattern is bypassed by `with` expressions (see warning below). (UI view models may expose `IsValid`; this rule is for domain objects.)
 - MUST include `nameof()` in every `ArgumentException` call that refers to a parameter name. **Rationale**: Eliminates magic strings that silently rot under rename refactoring.
 
 ### SHOULD
@@ -64,14 +64,22 @@ Value objects wrap primitive types in domain-meaningful types that enforce invar
 
 > ⚠️ **EF Core `ComplexProperty` requires a private parameterless constructor on value objects.** If your value object will be flattened into an entity table via `ComplexProperty` (see Decision Point 8), you MUST add `private TypeName() : this(default, default!) { }`. Without it, EF Core cannot materialize the object and will throw at runtime. Add it when you create the value object — don't backfill later.
 >
-> ⚠️ **`with` expressions bypass property initializer validation on records.** The compiler-generated copy constructor used by `with` does a field-by-field copy and does NOT run property initializers (the `= value ?? throw` part). This means `original with { Id = Guid.Empty }` silently skips the validation guard. Fix: move validation into the `init` accessor body using the C# 14 `field` keyword: `init => field = value ?? throw ...`. This fires for both `new` and `with`. Caveat: cross-property validation in `init` accessors is order-sensitive — the order of assignments in the `with` expression determines which property validates against which.
+> ⚠️ **`with` expressions bypass property initializer validation on records.** The compiler-generated copy constructor used by `with` does a field-by-field copy and does NOT run property initializers (the `= value ?? throw` part). This means `original with { Id = Guid.Empty }` silently skips the validation guard. Two fixes, depending on the validation type:
+> 
+> **Single-property validation** (non-empty GUID, non-null string, non-negative number): move validation into the `init` accessor body using the C# 14 `field` keyword — `init => field = value ?? throw`. This fires for both `new` and `with`.
+> 
+> **Cross-property validation** (Min ≤ Max, date range ordering): remove `init` from the cross-validated properties entirely, using bare `{ get; }`. `with` cannot touch a property without an `init` setter — the user is forced back through the constructor where all parameters are in scope for simultaneous validation. The record still provides value equality, `ToString()`, and `Deconstruct()`.
 
 ```csharp
 internal record TransferId(Guid Id)
 {
-    public Guid Id { get; init; } =
-        Id != Guid.Empty ? Id
-        : throw new ArgumentException("TransferId cannot be empty");
+    // Single-property validation in init body — fires for both `new` and `with`
+    public Guid Id
+    {
+        get;
+        init => field = Id != Guid.Empty ? Id
+            : throw new ArgumentException("TransferId cannot be empty", nameof(Id));
+    }
 
     public static TransferId NewId() => new TransferId(Guid.NewGuid());
 
@@ -83,9 +91,12 @@ internal record TransferId(Guid Id)
 ```csharp
 internal record AccountId(Guid Id)
 {
-    public Guid Id { get; init; } =
-        Id != Guid.Empty ? Id
-        : throw new ArgumentException("Account ID must be a non-empty GUID.", nameof(Id));
+    public Guid Id
+    {
+        get;
+        init => field = Id != Guid.Empty ? Id
+            : throw new ArgumentException("Account ID must be a non-empty GUID.", nameof(Id));
+    }
 
     public static AccountId? TryCreate(Guid? id) =>
         id is Guid g && g != Guid.Empty ? new AccountId(g) : null;
@@ -95,17 +106,26 @@ internal record AccountId(Guid Id)
 ```csharp
 internal record Iso4217Currency(string AlphabeticCode, int NumericCode, int DecimalPlaces)
 {
-    public string AlphabeticCode { get; init; } =
-        !string.IsNullOrWhiteSpace(AlphabeticCode) && AlphabeticCode.Length == 3 && AlphabeticCode.All(char.IsUpper) ? AlphabeticCode
-        : throw new ArgumentException("Alphabetic code must be a three-letter uppercase string.", nameof(AlphabeticCode));
+    public string AlphabeticCode
+    {
+        get;
+        init => field = !string.IsNullOrWhiteSpace(AlphabeticCode) && AlphabeticCode.Length == 3 && AlphabeticCode.All(char.IsUpper) ? AlphabeticCode
+            : throw new ArgumentException("Alphabetic code must be a three-letter uppercase string.", nameof(AlphabeticCode));
+    }
 
-    public int NumericCode { get; init; } =
-        NumericCode > 0 && NumericCode <= 999 ? NumericCode
-        : throw new ArgumentException("Numeric code must be a three-digit number between 001 and 999.", nameof(NumericCode));
+    public int NumericCode
+    {
+        get;
+        init => field = NumericCode > 0 && NumericCode <= 999 ? NumericCode
+            : throw new ArgumentException("Numeric code must be a three-digit number between 001 and 999.", nameof(NumericCode));
+    }
 
-    public int DecimalPlaces { get; init; } =
-        DecimalPlaces >= 0 ? DecimalPlaces
-        : throw new ArgumentException("Minor unit must be a non-negative integer.", nameof(DecimalPlaces));
+    public int DecimalPlaces
+    {
+        get;
+        init => field = DecimalPlaces >= 0 ? DecimalPlaces
+            : throw new ArgumentException("Minor unit must be a non-negative integer.", nameof(DecimalPlaces));
+    }
 }
 ```
 
@@ -136,9 +156,12 @@ Entity constructors are `internal`, mutable state uses `{ get; private set; }`, 
 ```csharp
 internal record PersonId(Guid Id)
 {
-    public Guid Id { get; init; } =
-        Id != Guid.Empty ? Id
-        : throw new ArgumentException("PersonId cannot be empty", nameof(Id));
+    public Guid Id
+    {
+        get;
+        init => field = Id != Guid.Empty ? Id
+            : throw new ArgumentException("PersonId cannot be empty", nameof(Id));
+    }
 
     public static PersonId NewId() => new(Guid.NewGuid());
 }
@@ -1223,7 +1246,7 @@ public static class EstimateComposition
 - MUST ensure EF Core persistence of immutable records uses an `UpdateImmutable<T>()` extension that detaches the original, copies values from the modified copy, and aligns navigation graphs. **Rationale**: EF Core's change tracker cannot detect property changes on immutable types; manual graph alignment is required.
 
 ### SHOULD
-- SHOULD validate invariants spanning multiple properties in the `init` accessor of the collection property itself (e.g., verifying all items share the same currency as the parent). **Rationale**: Co-locates cross-property validation with the data it guards.
+- SHOULD validate invariants spanning multiple properties in the `init` accessor body of the collection property itself (e.g., verifying all items share the same currency as the parent). **Rationale**: Co-locates cross-property validation with the data it guards. Unlike property initializers (`= value ?? throw`), `init` accessor bodies (`init { ... }` or `init =>`) do fire during copy-constructor-based initialization (`new(this) { ... }`). For single-property validation, prefer the C# 14 `field` keyword: `init => field = value ?? throw` — this fires for both construction and copy-constructor paths.
 
 ### MAY
 - MAY use `ImmutableList<T>` for collection properties in deep-immutable aggregates. **Rationale**: Prevents accidental mutation of the backing collection from any reference holder. However, `ImmutableList<T>` has O(log n) indexed access, ~40 bytes per element memory overhead, and is not natively supported as an EF Core navigation type — EF Core cannot initialize or materialize `ImmutableList<T>` automatically (dotnet/efcore issue #21176, open since 2020). The recommended pattern for EF Core aggregates is the `private List<T>` backing field with `public IReadOnlyCollection<T>` accessor shown in Decision Point 2.
@@ -1245,9 +1268,12 @@ internal class Invoice(
     private int Id { get; init; }
     public Guid PublicId { get; private init; } = Guid.NewGuid();
     public InvoiceNumber Number { get; init; } = number;
-    public string CustomerName { get; init; } =
-        !string.IsNullOrEmpty(customerName) ? customerName
-        : throw new ArgumentException("Customer name cannot be null or empty.", nameof(customerName));
+    public string CustomerName
+    {
+        get;
+        init => field = !string.IsNullOrEmpty(customerName) ? customerName
+            : throw new ArgumentException("Customer name cannot be null or empty.", nameof(customerName));
+    }
 
     private List<InvoiceLine> _lines = new();
     public IReadOnlyCollection<InvoiceLine> Lines
@@ -1371,7 +1397,7 @@ When you encounter a concept not shown in the examples, derive the correct patte
 
 **To model a new value type** (e.g., `EmailAddress`, `GeoCoordinate`, `PhoneNumber`):
 1. Declare an `internal record` with a positional primary constructor (use `public record` only in a shared kernel assembly — see Decision Point 6)
-2. Add `{ get; init; }` with ternary + throw for any invariants
+2. Validate in the `init` accessor body using the C# 14 `field` keyword for single-property validation (`init => field = value ?? throw`); for cross-property validation, remove `init` entirely (`{ get; }` only) to force construction through the constructor where all parameters are in scope
 3. Use `nameof()` in all exceptions
 4. If construction can fail for user input, add a `TryCreate()` factory returning `T?` (use `TryCreateNew()` for aggregate roots — see Decision Point 2)
 5. If the type needs arithmetic or comparison, define operator overloads
