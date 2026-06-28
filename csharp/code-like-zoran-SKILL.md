@@ -91,7 +91,37 @@ Value objects wrap primitive types in domain-meaningful types that enforce invar
 
 > ⚠️ **C# 14 positional records with explicit property declarations**: The compiler emits CS8907 ("Parameter is unread") when a positional record parameter shares a name with an explicitly declared property that doesn't consume it. Fix by adding `= ParameterName` property initializer — e.g., `public string Code { get; init => ... } = Code;`. Do NOT suppress CS8907 globally; it catches real name-mismatch bugs.
 >
-> ⚠️ **`init` accessor parameter scoping**: In `init => field = Value != default ? Value : throw`, the `Value` identifier refers to the init accessor's implicit `value` parameter, NOT the primary constructor parameter of the same name. The init parameter takes precedence. Use distinct names if this ambiguity matters to readers.
+> ⚠️ **C# 14 primary constructor parameter scoping with `field` keyword**: When a primary constructor parameter shares a name with a property, **scoping rules differ by context**:
+>
+> - **Property initializers** (`= paramName`): The parameter **shadows** the member. `= id` correctly references the constructor parameter.
+> - **Accessor bodies** (`init =>`, `get =>`, method bodies): The member **shadows** the parameter. `Id` in an accessor body refers to the **property**, not the constructor parameter.
+>
+> **Correct pattern**: Use **lowercase parameter names** in primary constructors and **`value`** in init accessors:
+> ```csharp
+> internal record TransferId(Guid id)  // lowercase parameter
+> {
+>     public Guid Id
+>     {
+>         get;
+>         init => field = value != Guid.Empty ? value  // `value` = implicit init parameter
+>             : throw new ArgumentException("TransferId cannot be empty", nameof(Id));
+>     } = id;  // `id` = constructor parameter (initializer scope)
+> }
+> ```
+>
+> **Incorrect pattern** (works through fragile initialization order, but semantically wrong):
+> ```csharp
+> internal record TransferId(Guid Id)  // uppercase parameter
+> {
+>     public Guid Id
+>     {
+>         get;
+>         init => field = Id != Guid.Empty ? Id  // ❌ `Id` = property, not parameter!
+>             : throw new ArgumentException("TransferId cannot be empty", nameof(Id));
+>     } = Id;
+> }
+> ```
+> In the incorrect pattern, `Id` in the init body calls the property's getter (which reads the backing field), not the constructor parameter. This works only because the property initializer `= Id` already set the field from the parameter. Use `value` explicitly to avoid this ambiguity. See [C# 12 primary constructors spec](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/proposals/csharp-12.0/primary-constructors#lookup) and [Roslyn issue #80771](https://github.com/dotnet/roslyn/issues/80771).
 >
 > ⚠️ **CS9264 and `[field: MaybeNull, AllowNull]`**: When the compiler cannot infer null-resilience for a `field`-backed non-nullable property (common with `private` parameterless constructors for EF Core materialization), add both `[field: MaybeNull, AllowNull]` to the property declaration — e.g., `[field: MaybeNull, AllowNull] public string Code { get; init => ... }`. `MaybeNull` tells the compiler the field may be null when read (suppressing CS9264); `AllowNull` permits null writes. Per the official docs, both are needed — `MaybeNull` alone is incomplete. Do NOT suppress CS9264 globally.
 
@@ -101,9 +131,10 @@ Value objects wrap primitive types in domain-meaningful types that enforce invar
 - MUST include `nameof()` in every `ArgumentException` call that refers to a parameter name. **Rationale**: Eliminates magic strings that silently rot under rename refactoring.
 
 ### SHOULD
+- SHOULD use `DateTimeOffset` (or a `Timestamp` value object wrapping it) for all domain properties that represent moments in time — transaction timestamps, audit fields, scheduling dates, billing periods, expiry dates. `DateTimeOffset` carries its UTC offset through SQL Server's `datetimeoffset` column, making the value unambiguous regardless of time zone. Reserve `DateTime` only for pure dates (`DateOnly`) or abstract times (`TimeOnly`). When wrapping in a `Timestamp` value object, validate that the offset is UTC in the `init` accessor. **Rationale**: Microsoft's official guidance: "Consider DateTimeOffset as the default date and time type for application development." `DateTime.Kind` is silently stripped by SQL Server, requiring a converter to reapply — the converter's existence is evidence that `DateTime` is the wrong type. Billing systems in particular are vulnerable to DST-related double-charging when timestamps are ambiguous. **Exception**: Use `DateTime` when integrating with legacy systems that require it, when the database schema cannot be migrated, or when performance testing shows `DateTimeOffset` overhead is unacceptable.
 - SHOULD provide a static `NewId()` factory method for ID value objects that wraps `Guid.NewGuid()`. **Rationale**: Centralizes GUID generation; makes intent explicit at the call site.
 - SHOULD prefer `Guid`-wrapped IDs for public-facing identifiers (exposed in DTOs, URLs, or external systems) for their non-guessability and global uniqueness. **Rationale**: `Guid` IDs prevent enumeration attacks and eliminate coordination overhead in distributed systems. MAY use `int` or `long`-wrapped IDs for internal identifiers where sequential ordering or compact storage matters.
-- SHOULD provide well-known static instances for reference-data value objects (`Currency.USD`, `Timestamp.UtcNow`). **Rationale**: Static instances serve as a canonical registry discoverable at the call site, eliminating magic strings. ⚠️ Do NOT provide `Empty` sentinels for ID types — Microsoft explicitly advises against sentinel values, and `field`-based validation (`init => field = Value != Guid.Empty ? Value : throw`) blocks `Guid.Empty` anyway. Use `TryCreate` returning `T?` instead; `null` already means "no ID."
+- SHOULD provide well-known static instances for reference-data value objects (`Currency.USD`, `Timestamp.UtcNow`). **Rationale**: Static instances serve as a canonical registry discoverable at the call site, eliminating magic strings. ⚠️ Do NOT provide `Empty` sentinels for ID types — Microsoft explicitly advises against sentinel values, and `field`-based validation (`init => field = value != Guid.Empty ? value : throw`) blocks `Guid.Empty` anyway. Use `TryCreate` returning `T?` instead; `null` already means "no ID."
 - SHOULD include more than a single field in value objects when additional data naturally clusters with the core value (e.g., `Iso4217Currency` in `Money`). **Rationale**: Co-locating related data prevents primitive obsession and enables domain arithmetic without back-referencing external data.
 - SHOULD bundle domain rules into the value object itself — not in a separate service. Example: `Currency` carries `DecimalPlaces` so `Money` can auto-round without consulting an external configuration. **Rationale**: The value object becomes both identity and policy carrier; callers never need to know which currency has which precision. When reference data comes from an external source or needs dependency injection, MAY use a provider/registry pattern (`IIso4217CurrencyProvider`) instead of embedding all metadata in the value object.
 
@@ -121,15 +152,16 @@ Value objects wrap primitive types in domain-meaningful types that enforce invar
 > **Cross-property validation** (Min ≤ Max, date range ordering): remove `init` from the cross-validated properties entirely, using bare `{ get; }`. `with` cannot touch a property without an `init` setter — the user is forced back through the constructor where all parameters are in scope for simultaneous validation. The record still provides value equality, `ToString()`, and `Deconstruct()`.
 
 ```csharp
-internal record TransferId(Guid Id)
+internal record TransferId(Guid id)
 {
     // Single-property validation in init body — fires for both `new` and `with`
+    // Use `value` (implicit init parameter), not the property name
     public Guid Id
     {
         get;
-        init => field = Id != Guid.Empty ? Id
+        init => field = value != Guid.Empty ? value
             : throw new ArgumentException("TransferId cannot be empty", nameof(Id));
-    } = Id;
+    } = id;
 
     public static TransferId NewId() => new TransferId(Guid.NewGuid());
 
@@ -139,14 +171,14 @@ internal record TransferId(Guid Id)
 ```
 
 ```csharp
-internal record AccountId(Guid Id)
+internal record AccountId(Guid id)
 {
     public Guid Id
     {
         get;
-        init => field = Id != Guid.Empty ? Id
+        init => field = value != Guid.Empty ? value
             : throw new ArgumentException("Account ID must be a non-empty GUID.", nameof(Id));
-    } = Id;
+    } = id;
 
     public static AccountId? TryCreate(Guid? id) =>
         id is Guid g && g != Guid.Empty ? new AccountId(g) : null;
@@ -154,29 +186,29 @@ internal record AccountId(Guid Id)
 ```
 
 ```csharp
-internal record Iso4217Currency(string AlphabeticCode, int NumericCode, int DecimalPlaces)
+internal record Iso4217Currency(string alphabeticCode, int numericCode, int decimalPlaces)
 {
     [field: MaybeNull, AllowNull]
     public string AlphabeticCode
     {
         get;
-        init => field = !string.IsNullOrWhiteSpace(AlphabeticCode) && AlphabeticCode.Length == 3 && AlphabeticCode.All(char.IsUpper) ? AlphabeticCode
+        init => field = !string.IsNullOrWhiteSpace(value) && value.Length == 3 && value.All(char.IsUpper) ? value
             : throw new ArgumentException("Alphabetic code must be a three-letter uppercase string.", nameof(AlphabeticCode));
-    } = AlphabeticCode;
+    } = alphabeticCode;
 
     public int NumericCode
     {
         get;
-        init => field = NumericCode > 0 && NumericCode <= 999 ? NumericCode
+        init => field = value > 0 && value <= 999 ? value
             : throw new ArgumentException("Numeric code must be a three-digit number between 001 and 999.", nameof(NumericCode));
-    } = NumericCode;
+    } = numericCode;
 
     public int DecimalPlaces
     {
         get;
-        init => field = DecimalPlaces >= 0 ? DecimalPlaces
+        init => field = value >= 0 ? value
             : throw new ArgumentException("Minor unit must be a non-negative integer.", nameof(DecimalPlaces));
-    } = DecimalPlaces;
+    } = decimalPlaces;
 
     // Required by EF Core for ComplexProperty materialization
     private Iso4217Currency() : this(default!, default, default) { }
@@ -193,10 +225,11 @@ Entity constructors are `internal`, mutable state uses `{ get; private set; }`, 
 - MUST declare entity constructors as `internal`, never `public`. **Rationale**: Forces all construction through controlled factory methods that can normalize input and reject invalid combinations.
 - MUST use `{ get; private set; }` for mutable state and `{ get; init; }` for immutable one-time-set properties. **Rationale**: `private set` scopes mutation to the aggregate.
 - MUST back collection properties with a private `List<T>` field and expose a public `IEnumerable<T>` or `IReadOnlyCollection<T>` accessor. **Rationale**: Prevents external mutation of child collections.
+- MUST ensure a `TryCreateNew()` method has at least one code path that returns `null`. A factory that always succeeds must use `Create()` or `New()` instead — the `Try` prefix signals to callers that failure is possible and they must handle it. A `TryCreateNew()` that never returns null is a violation of the established .NET Try-pattern convention (every built-in `TryXxx` method — `TryParse`, `TryGetValue`, `TryAdd`, `Uri.TryCreate` — has a documented failure path). **Rationale**: The Try-pattern is defined by Microsoft's Framework Design Guidelines for members that "might throw/return false in common scenarios." A `Try`-prefixed method that always succeeds misleads callers into writing unnecessary null checks and erodes trust in the naming convention.
 
 ### SHOULD
 - SHOULD provide a static `XxxConstruction` class containing `extension(Xxx)` factory methods for construction and persistence reconstitution. **Rationale**: Separates construction logic from the aggregate itself, keeping the type focused on behavior rather than factory boilerplate.
-- SHOULD name factory methods `TryCreateNew()` (returning `T?` for user-input validation) and `TryRestore()` (returning `T?` for persistence reconstitution). **Rationale**: The naming convention distinguishes fresh creation from database reconstitution; nullable return signals soft failure to the caller.
+- SHOULD name persistence reconstitution factories `TryRestore()` (returning `T?`). **Rationale**: Distinguishes database hydration from fresh creation; nullable return signals soft failure if stored data is corrupt.
   > ⚠️ **`TryRestore` and property accessibility**: Since `XxxConstruction` is a separate static class, it cannot set `private set` properties via object initializers. Two approaches:
   > 
   > 1. **Constructor approach** — Pass ALL properties (including mutable ones like `IsActive`, `CanceledAt`) through the entity's primary constructor. The factory calls `new Entity(...)` with all values — never `new Entity(...) { PrivateSetProp = x }`. This keeps properties as `private set` but grows the constructor signature with every mutable field.
@@ -206,20 +239,21 @@ Entity constructors are `internal`, mutable state uses `{ get; private set; }`, 
 - SHOULD model entity state as a discriminated union property (see Decision Point 3) rather than an enum or flag, and guard mutable operations with pattern-match checks against the current state. Example: `_state is Editing edit ? PerformEdit(edit) : throw...`.
 - SHOULD use the `field` keyword (C# 14) in `set` and `init` accessors when validation logic or mutation gating needs access to the backing value. **Rationale**: Eliminates the boilerplate of declaring a separate private backing field when all the accessor does is validate-then-assign. Example: `set => field = InEditable(value);` or `init => field = value.All(...) ? value : throw ...`.
 - SHOULD use `private init` for identity properties that must never change after construction (e.g., `Ordinal`, `Id` on child entities). **Rationale**: `private init` allows setting during construction or via a `With*` factory within the same type, but blocks all external mutation — the compiler enforces that the property is set exactly once.
+- SHOULD snapshot mutable reference data as an immutable value object at the point of association. When an aggregate references another entity whose properties must remain constant for the aggregate's lifetime (e.g., a Subscription needs the Plan's price and billing cycle frozen at creation time), embed those properties as a value object within the aggregate rather than relying solely on a live FK lookup. This is the **Snapshot pattern** (Fowler) — standard in billing systems, where Stripe makes `Price` objects immutable by design. Changes to the referenced entity do not retroactively affect snapshots.
 
 ### MAY
 - MAY use `required` init-only properties instead of constructor parameters for optional aggregate fields. **Rationale**: Allows callers to set only the properties they care about while keeping the constructor manageable.
 - MAY define computed properties that aggregate over child collections (e.g., `Invoice.Total`, `Order.Subtotal`). **Rationale**: Derived values that are a pure function of the aggregate's state should live on the aggregate, not in a separate service or query layer.
 
 ```csharp
-internal record PersonId(Guid Id)
+internal record PersonId(Guid id)
 {
     public Guid Id
     {
         get;
-        init => field = Id != Guid.Empty ? Id
+        init => field = value != Guid.Empty ? value
             : throw new ArgumentException("PersonId cannot be empty", nameof(Id));
-    } = Id;
+    } = id;
 
     public static PersonId NewId() => new(Guid.NewGuid());
 }
@@ -316,7 +350,7 @@ Discriminated unions model mutually exclusive states with exhaustive compile-tim
 ### SHOULD
 - SHOULD seal union variants to prevent further subclassing that would break exhaustiveness checks. **Rationale**: An open variant hierarchy invites extensions that silently escape pattern-match coverage; `sealed` makes the closed set of states a compiler-enforced guarantee.
 - SHOULD define interface markers (`IApprovable`, `IRejectable`) for capability grouping across variants. **Rationale**: Interfaces allow method signatures to accept only the subset of variants that support a given operation, narrowing the surface at the call site.
-- SHOULD provide static factory methods in an `XxxConstruction` class that validate inputs before constructing variants. **Rationale**: Separates validation from the record declarations, keeping variant types clean while preventing invalid states.
+- SHOULD provide static factory methods in an `XxxConstruction` class that validate inputs before constructing variants. **Rationale**: Separates validation from the record declarations, keeping variant types clean while preventing invalid states. When a variant's construction depends on data from a referenced aggregate (e.g., billing period from a Plan), receive that data as an explicit parameter — **see DP6 for the service-layer orchestration pattern**.
 - SHOULD implement state transitions on the variants themselves as methods returning the abstract root type. **Rationale**: Each variant knows its own valid transitions; returning the root type ensures callers always pattern-match the result.
 
 ### MAY
@@ -561,6 +595,7 @@ A feature ships as a self-contained class library with one or two public interfa
 - SHOULD return `Task<T?>` or a result union from methods where failure is expected and recoverable — never throw across the public API boundary for business-rule rejections. **Rationale**: Exceptions for programmer errors; nullable/result types for recoverable failures.
 - SHOULD extract shared value objects (`Money`, `Timestamp`, `Currency`) into a shared kernel assembly when they are used by multiple feature libraries. In the shared kernel, these types may be `public record`. **Rationale**: Prevents duplicate implementations of the same concept across features. Within a single feature, domain types remain `internal`.
 - SHOULD inject `ILogger<T>` into internal service implementations and log validation failures, business rule rejections, and exceptions. **Rationale**: The public API boundary and validation points are natural logging locations; structured logging enables production diagnostics without coupling to a specific sink.
+- SHOULD load referenced aggregates before mutation when their state is needed for domain rules — not merely for FK validation. If the command depends on the referenced aggregate's state (e.g., a Subscription needs the Plan's `BillingPeriod` or must verify the Plan is active), load it in the service layer and return a typed failure (`null`) if absent. A bare existence query whose sole purpose is avoiding a `DbUpdateException` is optional; prefer designs where the referenced aggregate owns the creation flow (e.g., `Plan.StartSubscription()`). **Always retain the database FK constraint** as the final integrity guarantee — the referenced aggregate could be deleted between the read and `SaveChanges`.
 
   Example `SharedKernel` project:
   ```
@@ -631,6 +666,8 @@ internal sealed class TransferService(
 > For the default case, `T?` + guard clause is sufficient and idiomatic.
 > For simpler cases with 1–2 null-checks, imperative style is acceptable. For 3+ sequential validations, prefer the pipeline.
 
+> **SHOULD pass domain data from referenced aggregates into factory methods, not hardcode defaults.** When state creation depends on data from a related aggregate (e.g., a Subscription's active period must match the Plan's `BillingPeriod`), load the referenced aggregate in the service layer, extract the needed value, and pass it as a parameter. **Correct**: `Subscription.ActiveState(plan.BillingPeriod)`. **Incorrect**: `Subscription.ActiveState()` with a hardcoded `AddMonths(1)`. Hardcoding a default that duplicates knowledge already in another aggregate creates silent drift when the source data changes. See DP3 for state machine factory guidance.
+
 **File: `FeatureLibraries/Transfers/ServiceCollectionExtensions.cs`** — one-call registration
 
 ```csharp
@@ -655,6 +692,8 @@ public static class TransferServiceCollectionExtensions
 > `services.Configure<TOptions>(IConfiguration)` requires the `Microsoft.Extensions.Options.ConfigurationExtensions` package. For a dependency-free alternative, use the `Action<TOptions>` overload: `services.Configure<TransferOptions>(opts => configuration.GetSection("Transfers").Bind(opts))`.
 >
 > `UseSqlServer()` requires the `Microsoft.EntityFrameworkCore.SqlServer` NuGet package. For provider-agnostic libraries, prefer the `Action<DbContextOptionsBuilder>` overload of `AddTransfers()` so consumers supply their own provider.
+
+> ⚠️ **MUST NOT use `opts => { }` as a default for `Action<DbContextOptionsBuilder>`.** Use `null` if configuration is optional (allows `OnConfiguring` fallback, matching Microsoft's `AddDbContext`). Make the parameter required (non-nullable) if configuration is mandatory (matching Microsoft's `AddDbContextPool`). An empty action default silently produces `InvalidOperationException: No database provider has been configured` at runtime — no compile-time or startup-time detection. EF Core's internal `IsConfigured` check detects provider extensions; an empty action adds none.
 
 **File: `FeatureLibraries/Transfers/TransferOptions.cs`** — self-documenting configuration
 
@@ -733,14 +772,32 @@ Strict separation: the domain knows nothing about persistence. Configuration bea
   builder.HasKey("Id");
   ```
 
-  **Critical edge case**: When the domain model already has a property named `Id` (typed as a value object like `TransferId`), the shadow PK must use a different name to avoid collision:
-  ```csharp
-  builder.Property<int>("Key")           // shadow property named "Key" — avoids collision with domain's "Id"
-      .HasColumnName("Id")               // database column still named "Id"
-      .ValueGeneratedOnAdd();
-  builder.HasKey("Key");
-  ```
-  **Rationale**: EF Core cannot have a shadow property and a CLR property with the same name. Rename it and use `HasColumnName` to preserve the database convention.
+  > 🚨 **CRITICAL: Column name collision when domain has `Id` property**
+  >
+  > If your entity has a domain property named `Id` (typed as a value object like `TransferId`), you **MUST** rename the shadow PK to avoid a column name collision. EF Core 7+ throws `InvalidOperationException: All properties on an entity type must be mapped to unique different columns` when two properties map to the same column.
+  >
+  > **Incorrect** (causes collision):
+  > ```csharp
+  > builder.Property<int>("Id").ValueGeneratedOnAdd();   // ← shadow PK maps to column "Id"
+  > builder.HasKey("Id");
+  > builder.Property(p => p.Id).HasConversion(...);       // ← domain property ALSO maps to column "Id"
+  > // ❌ ERROR: Two properties cannot map to the same column "Id"
+  > ```
+  >
+  > **Correct** (rename shadow PK):
+  > ```csharp
+  > builder.Property<int>("Key")           // shadow property named "Key" — avoids collision
+  >     .HasColumnName("Id")               // database column still named "Id"
+  >     .ValueGeneratedOnAdd();
+  > builder.HasKey("Key");
+  > builder.Property(p => p.Id)            // domain property maps to its own column
+  >     .HasConversion(new PlanIdConverter())
+  >     .HasColumnName("PublicId");        // explicit column name for domain ID
+  > ```
+  >
+  > **Rule**: If your domain model has a property named `Id`, the shadow PK **MUST** use a different name (e.g., `"Key"`). Use `HasColumnName()` to control the actual database column names. This error occurs at model validation time — both during migration generation and at runtime when the `DbContext` is first used.
+
+  **Rationale**: EF Core cannot have a shadow property and a CLR property with the same name mapping to the same column. Rename the shadow property and use `HasColumnName` to preserve the database convention.
 
   > ⚠️ **Shadow PKs apply to entities only — NOT to value objects mapped via `ComplexProperty`.** Complex types (e.g., `Money`, `Timestamp`, `BillingPeriod`) have no identity — no key, not even a shadow one. They are structurally part of the owning entity's row. Do NOT add `builder.Property<int>("Id")` or `builder.HasKey("Id")` inside an `IEntityTypeConfiguration<SomeValueObject>` — value objects are not configured with `IEntityTypeConfiguration<T>`, only `ComplexProperty()` lambdas. See the SHOULD section below for ComplexProperty configuration.
 
@@ -827,7 +884,7 @@ c.Property(x => x.DecimalPlaces)
       }
   }
   ```
-  **Rationale**: SQL Server does not preserve `DateTimeKind`. The converter must explicitly re-specify `DateTimeKind.Utc` when reading back, otherwise the domain invariant (`Timestamp` must be UTC) silently breaks.
+  **Rationale**: SQL Server does not preserve `DateTimeKind`. The converter must explicitly re-specify `DateTimeKind.Utc` when reading back, otherwise the domain invariant (`Timestamp` must be UTC) silently breaks. **Note**: This converter is only needed when `DateTime` is unavoidable (legacy schemas). Prefer `DateTimeOffset` for all new domain properties — see Decision Point 1.
 
   For trivial GUID wrappers, inline lambdas or nested converters suffice:
   ```csharp
@@ -970,6 +1027,7 @@ Handler methods receive `IDbContextFactory<T>` via DI, then create a short-lived
 - Place entity configuration in `Data/EntityConfiguration/` — one `IEntityTypeConfiguration<T>` file per entity, applied via `modelBuilder.ApplyConfiguration()` in `OnModelCreating()`. **Rationale**: Keeps mapping logic separate from the `DbContext` and the domain model, so neither knows about the other.
 - For multi-entity write operations, wrap in a transaction: `await using var tx = await db.Database.BeginTransactionAsync(ct);` and commit/rollback explicitly. **Rationale**: Multiple `SaveChangesAsync` calls without a transaction boundary leave the database in an inconsistent state on partial failure.
 - Handle `DbUpdateConcurrencyException` at the service layer when optimistic concurrency conflicts occur. Retry or surface the conflict to the caller as a recoverable failure. **Rationale**: Line-of-business applications with concurrent editors need explicit conflict resolution; silent overwrites are unacceptable.
+- ⚠️ **EF Core does not fix up navigation properties when you call `db.Add()` or `db.Remove()` directly.** The parent entity's navigation property remains stale in memory until `SaveChanges()` completes. This is by design — the EF team explicitly closed requests for pre-SaveChanges fixup (issues #23940, #10008). **Prefer manipulating the navigation** (fixup triggers automatically): `parent.States.Add(stateEntity);` → `parent.State` is immediately updated. **Or explicitly set the navigation after the operation**: `subscription.State = state;` after `db.Add(state)`. Without this, DTO conversions reading the stale navigation will return incorrect data (e.g., `subscription.ToResultDto()` with `State = "Unknown"` after a successful `CreateSubscriptionAsync`).
 - ⚠️ **`is` pattern matching and `OfType<T>()` do not translate to SQL when the property is mapped via `ValueConverter`.** EF Core stores a primitive (e.g., `string`) but materializes a complex CLR type. `db.Invoices.Where(i => i.Status is Draft)` fails at runtime with "could not be translated." Use one of:
   1. Query by the stored primitive value directly (add a shadow discriminator property and filter on it).
   2. `ToListAsync()` then filter client-side with `.Where(i => i.Status is Draft)`.
@@ -1177,10 +1235,14 @@ public sealed class CreateSubscriptionTests
 Zoran keeps every layer in its own type — domain models, database rows, query DTOs, and response DTOs — and converts between them with explicit, hand-written extension methods. No AutoMapper, no implicit operators, no reflection. Each conversion method is a trivial constructor call that a reader can verify in one glance, and because the source type is already validated before conversion, the method never needs to fail.
 
 ### MUST
-- MUST convert between layer types via explicit extension methods placed in a static class named `{SourceType}Conversions`. **Rationale**: Explicit conversion methods are greppable, testable, and immune to silent mis-mappings that plague convention-based mappers.
+- MUST NOT allow a domain type file (e.g., `Company.cs`, `Plan.cs`) to import or reference a DTO, response type, or presentation concern. **Rationale**: This is the real dependency test — a domain type that knows about `CompanyResponseDto` is coupled to an outer layer. The domain must have zero dependencies on outer layers.
+- MUST place domain→DTO conversion code where it can reference both domain types (inward) and DTO types (outward) without creating a backward dependency. In **multi-assembly** projects, conversions live in the Application or Presentation assembly. In **single-assembly** feature libraries, a `Conversions/` subfolder or separate namespace is sufficient — the conversion file references both types as the bridge between layers, while domain type files remain isolated. **Correct** (multi-assembly): `Application/Conversions/CompanyConversions.cs` with `extension(Company model) { public CompanyResponseDto ToResponseDto() => ... }`. **Correct** (single-assembly): `FeatureLibrary/Conversions/CompanyConversions.cs` with `extension(Company model) { public CompanyResponseDto ToResponseDto() => ... }` — `Company.cs` never imports `CompanyResponseDto`. **Incorrect**: `Domain/Entities/Company.cs` with a `ToDto()` method, or a domain type file with a `using` for a DTO namespace.
+- MUST convert between layer types via explicit extension methods placed in a static class named `{SourceType}Conversions` or `{TargetType}Mappings`. **Rationale**: Explicit conversion methods are greppable, testable, and immune to silent mis-mappings that plague convention-based mappers.
 - MUST declare database row types as `internal record class {Name}Row` with primitive-typed positional parameters matching the query columns exactly. **Rationale**: Positional records map directly to Dapper or EF Core projections with zero ceremony and expose no mutable state outside the data layer.
 - MUST declare API response types as `public record class {Name}ResponseDto` with `{ get; init; }` properties or positional parameters. **Rationale**: Init-only or positional records guarantee the DTO is immutable after construction, consistent with the response-not-mutated contract.
 - MUST place EF Core query-result types in `DataAccess/QueryModels/` as `internal record class {Name}Dto`. **Rationale**: Query model DTOs are an infrastructure concern; keeping them `internal` prevents the API layer from depending on database projection shapes.
+
+> ⚠️ **Backward dependency anti-pattern**: The test is simple — does a domain type file import a DTO namespace? If `Company.cs` has `using FeatureLibrary.Dtos;`, the domain is coupled outward. In multi-assembly projects, this is a physical build error (circular reference). In single-assembly projects, it's a logical violation that prevents clean extraction later. Conversion files are the bridge — they necessarily reference both domain types (inward) and DTO types (outward). Place them in a `Conversions/` folder or separate namespace, never inside domain type files.
 
 ### SHOULD
 - SHOULD offer conversion methods from every source type that can produce the target DTO, not just the domain model. **Rationale**: When a data-access query returns a `CompanyDto` directly, converting from the DTO avoids an unnecessary round-trip through the domain model.
@@ -1190,6 +1252,8 @@ Zoran keeps every layer in its own type — domain models, database rows, query 
 - MAY colocate the inline request DTO at the bottom of the feature's public interface file when the request type exists only for that single method. **Rationale**: Inline request records avoid polluting the project with one-line DTO files while keeping the binding type adjacent to its consuming method.
 
 ```csharp
+// File: Infrastructure/DataAccess/Conversions/PersonConversions.cs
+// ← Lives in Infrastructure layer, references Domain types (inward dependency)
 internal record class PersonRow(int Id, Guid PublicId, string FirstName, string LastName);
 
 internal static class PersonConversions
@@ -1203,23 +1267,31 @@ internal static class PersonConversions
 ```
 
 ```csharp
+// File: Presentation/Api/Conversions/CompanyResponseMappings.cs
+// ← Lives in Presentation layer, references Domain types (inward) and DTOs (outward)
 public record class CompanyResponseDto(CompanyHandle Handle, string Name, string IncorporatedInCode, string IncorporatedInName);
 
-public static class CompanyResponseDtoConversions
+public static class CompanyResponseMappings
 {
-    extension(Company model)
+    extension(Company model)  // Domain type — inward reference
     {
         public CompanyResponseDto ToResponseDto() =>
             new(model.Handle, model.Name, model.IncorporatedIn.Code, model.IncorporatedIn.Name);
     }
 
-    extension(CompanyDto queryModel)
+    extension(CompanyDto queryModel)  // Query DTO — also in Application layer
     {
         public CompanyResponseDto ToResponseDto() =>
             new(queryModel.Handle, queryModel.Name, queryModel.IncorporatedIn.Code, queryModel.IncorporatedIn.Name);
     }
 }
 ```
+
+> **Layer placement summary**:
+> - `PersonRow → Person` conversion: Infrastructure layer (data access → domain)
+> - `Company → CompanyResponseDto` conversion: Application/Presentation layer, or `Conversions/` folder in a single-assembly library (domain → API response)
+> - `CompanyDto → CompanyResponseDto` conversion: Same layer as above (query DTO → API response)
+> - **Never** place conversion logic inside a domain type file itself; conversion files bridge layers and reference both sides
 
 ---
 
