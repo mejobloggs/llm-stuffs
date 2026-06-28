@@ -129,7 +129,7 @@ internal record TransferId(Guid Id)
         get;
         init => field = Id != Guid.Empty ? Id
             : throw new ArgumentException("TransferId cannot be empty", nameof(Id));
-    }
+    } = Id;
 
     public static TransferId NewId() => new TransferId(Guid.NewGuid());
 
@@ -146,7 +146,7 @@ internal record AccountId(Guid Id)
         get;
         init => field = Id != Guid.Empty ? Id
             : throw new ArgumentException("Account ID must be a non-empty GUID.", nameof(Id));
-    }
+    } = Id;
 
     public static AccountId? TryCreate(Guid? id) =>
         id is Guid g && g != Guid.Empty ? new AccountId(g) : null;
@@ -156,26 +156,30 @@ internal record AccountId(Guid Id)
 ```csharp
 internal record Iso4217Currency(string AlphabeticCode, int NumericCode, int DecimalPlaces)
 {
+    [field: MaybeNull, AllowNull]
     public string AlphabeticCode
     {
         get;
         init => field = !string.IsNullOrWhiteSpace(AlphabeticCode) && AlphabeticCode.Length == 3 && AlphabeticCode.All(char.IsUpper) ? AlphabeticCode
             : throw new ArgumentException("Alphabetic code must be a three-letter uppercase string.", nameof(AlphabeticCode));
-    }
+    } = AlphabeticCode;
 
     public int NumericCode
     {
         get;
         init => field = NumericCode > 0 && NumericCode <= 999 ? NumericCode
             : throw new ArgumentException("Numeric code must be a three-digit number between 001 and 999.", nameof(NumericCode));
-    }
+    } = NumericCode;
 
     public int DecimalPlaces
     {
         get;
         init => field = DecimalPlaces >= 0 ? DecimalPlaces
             : throw new ArgumentException("Minor unit must be a non-negative integer.", nameof(DecimalPlaces));
-    }
+    } = DecimalPlaces;
+
+    // Required by EF Core for ComplexProperty materialization
+    private Iso4217Currency() : this(default!, default, default) { }
 }
 ```
 
@@ -193,7 +197,10 @@ Entity constructors are `internal`, mutable state uses `{ get; private set; }`, 
 ### SHOULD
 - SHOULD provide a static `XxxConstruction` class containing `extension(Xxx)` factory methods for construction and persistence reconstitution. **Rationale**: Separates construction logic from the aggregate itself, keeping the type focused on behavior rather than factory boilerplate.
 - SHOULD name factory methods `TryCreateNew()` (returning `T?` for user-input validation) and `TryRestore()` (returning `T?` for persistence reconstitution). **Rationale**: The naming convention distinguishes fresh creation from database reconstitution; nullable return signals soft failure to the caller.
-  > ⚠️ **`TryRestore` and property accessibility**: Since `XxxConstruction` is a separate static class, it cannot set `private set` properties via object initializers. Pass ALL properties (including mutable ones like `IsActive`, `CanceledAt`) through the entity's primary constructor. The factory calls `new Entity(...)` with all values — never `new Entity(...) { PrivateSetProp = x }`. This keeps properties as `private set` without needing `internal set` workarounds.
+  > ⚠️ **`TryRestore` and property accessibility**: Since `XxxConstruction` is a separate static class, it cannot set `private set` properties via object initializers. Two approaches:
+  > 
+  > 1. **Constructor approach** — Pass ALL properties (including mutable ones like `IsActive`, `CanceledAt`) through the entity's primary constructor. The factory calls `new Entity(...)` with all values — never `new Entity(...) { PrivateSetProp = x }`. This keeps properties as `private set` but grows the constructor signature with every mutable field.
+  > 2. **`internal set` approach** — Use `{ get; internal set; }` for mutable properties when the construction factory lives in the same assembly and constructor bloat is a concern. `internal set` is accessible to `XxxConstruction` (same assembly) but still blocks external mutation. This is not a workaround; it is a deliberate scoping decision for assemblies that co-locate domain and construction code.
 - SHOULD place nested ID record structs inside the aggregate class. **Rationale**: Scopes the ID type to its owning aggregate and avoids namespace pollution.
 - SHOULD gate mutable setters behind a status check (`InEditable<TValue>()`) when some states forbid mutation (e.g., an issued invoice cannot be modified). **Rationale**: Encodes state-machine rules at the property level.
 - SHOULD model entity state as a discriminated union property (see Decision Point 3) rather than an enum or flag, and guard mutable operations with pattern-match checks against the current state. Example: `_state is Editing edit ? PerformEdit(edit) : throw...`.
@@ -212,7 +219,7 @@ internal record PersonId(Guid Id)
         get;
         init => field = Id != Guid.Empty ? Id
             : throw new ArgumentException("PersonId cannot be empty", nameof(Id));
-    }
+    } = Id;
 
     public static PersonId NewId() => new(Guid.NewGuid());
 }
@@ -475,110 +482,65 @@ static class ComplexDomainDemo
 
 ## Decision Point 5: Handling Validation / Construction Failure
 
-Three failure-handling tiers. Hard failures (corrupt input): ternary + throw in `init` accessor bodies — no recovery. Soft failures (invalid user input): `TryCreateNew()` returning `T?`. Multi-step chains where all errors must accumulate: `Checked<T, TProblem>` monad (see MAY below).
+Three failure-handling tiers. Hard failures (corrupt input): ternary + throw in `init` accessor bodies — no recovery. Soft failures (invalid user input): `TryCreateNew()` returning `T?`. Multi-step validation pipelines: `.Bind()` on `T?` to chain `TryCreate` calls without nested null-checks.
 
 ### MUST
+
 - MUST use ternary + throw in `init` accessor bodies for invariants that are never expected to fail under correct system operation (e.g., non-empty GUID, non-negative amount). Prefer the C# 14 `field` keyword (`init => field = value ?? throw`) as shown in Decision Point 1 — it fires for both `new` and `with`. **Rationale**: Programming errors; the stack trace pinpoints the bug.
 - MUST NOT define `bool IsValid { get; }` properties or `void Validate()` methods called after construction on domain objects. **Rationale**: Post-construction validation creates a window where an invalid object exists. (UI view models may expose `IsValid`; this rule is for domain objects.)
 
 ### SHOULD
+
 - SHOULD use `TryCreateNew()` returning `T?` for user-input scenarios where failure is expected and recoverable. **Rationale**: Nullable return signals "try again" to the caller without throwing exceptions for normal control flow.
-
-### MAY
-- MAY use the `Checked<T, TProblem>` monad when multiple validation steps must compose and short-circuit on first failure. **Rationale**: `Bind()` propagates the first failure through the chain; the caller receives exactly one problem (the first one encountered) without cascading null checks. For accumulating all errors, use a separate result-list pattern.
-- MAY provide a `Match()` method on the checked monad for explicit success/failure branching at the consumption site. **Rationale**: Forces callers to handle both cases explicitly, preventing null-reference errors.
-- MAY accept a generic `TProblem` type (enum, string, custom record) in the checked monad. **Rationale**: Different domains may need different failure representations (error codes vs. messages vs. structured error objects).
-- MAY define monadic `extension(T?)` blocks with `Bind`, `Map`, `MapValue`, and `Match` for nullable types, both class and struct. **Rationale**: Treating `T?` as a monad enables fluent pipelines on nullable values without repeated null checks.
+- SHOULD use `.Bind()` on `T?` to compose 3+ sequential `TryCreate` validations into a single expression that short-circuits on first null. **Rationale**: A `.Bind()` pipeline replaces a staircase of `if (x is null) return null` guards with a left-to-right chain. The extension lives in a small `NullableExtensions` static class and works on class nullables. See Decision Point 6's `TransferService.RequestTransferAsync` for the integrated usage pattern.
 
 ```csharp
-abstract record Checked<T, TProblem>(T Value)
-{
-    public static Checked<T, TProblem> Unit(T value) => new Passed<T, TProblem>(value);
-    public static Checked<T, TProblem> Failed(T value, TProblem problem) => new Failed<T, TProblem>(value, problem);
-
-    public abstract Checked<T, TProblem> Bind(Func<T, Checked<T, TProblem>> func);
-    public abstract Checked<U, TProblem> Bind<U>(Func<T, Checked<U, TProblem>> func, U orElse);
-    public abstract Checked<U, TProblem> Map<U>(Func<T, U> func);
-    public abstract U Match<U>(Func<T, U> onPassed, Func<T, TProblem, U> onFailed);
-}
-
-sealed record Passed<T, TProblem>(T Value) : Checked<T, TProblem>(Value)
-{
-    public override Checked<T, TProblem> Bind(Func<T, Checked<T, TProblem>> func) =>
-        func(Value);
-
-    public override Checked<U, TProblem> Bind<U>(Func<T, Checked<U, TProblem>> func, U orElse) =>
-        func(Value);
-
-    public override Checked<U, TProblem> Map<U>(Func<T, U> func) =>
-        Checked<U, TProblem>.Unit(func(Value));
-
-    public override U Match<U>(Func<T, U> onPassed, Func<T, TProblem, U> onFailed) =>
-        onPassed(Value);
-}
-
-sealed record Failed<T, TProblem>(T Value, TProblem Problem) : Checked<T, TProblem>(Value)
-{
-    public override Checked<T, TProblem> Bind(Func<T, Checked<T, TProblem>> func) => this;
-
-    public override Checked<U, TProblem> Bind<U>(Func<T, Checked<U, TProblem>> func, U orElse) =>
-        Checked<U, TProblem>.Failed(orElse, Problem);
-
-    public override Checked<U, TProblem> Map<U>(Func<T, U> func) =>
-        Checked<U, TProblem>.Failed(default!, Problem);
-
-    public override U Match<U>(Func<T, U> onPassed, Func<T, TProblem, U> onFailed) =>
-        onFailed(Value, Problem);
-}
-```
-
-```csharp
-string report = Locate(new FileInfo(filePath))              // Checked<FileInfo, string>
-    .Bind(Read, [])                                          // Checked<string[], string>
-    .Bind(CheckLength)                                       // Checked<string[], string>
-    .Bind(CheckSorted)                                       // Checked<string[], string>
-    .Bind(CheckGrowingLines)                                 // Checked<string[], string>
-    .Match(
-        onPassed: lines => $"File is valid with {lines.Length} lines.",
-        onFailed: (lines, problem) => $"File check failed: {problem}"
-    );
-```
-
-```csharp
-static class NullableMonad
+// NullableExtensions — enable Bind on T? for pipeline composition
+internal static class NullableExtensions
 {
     extension<T>(T? value) where T : class
     {
-        public U? Bind<U>(Func<T, U?> func) where U : class =>
+        internal U? Bind<U>(Func<T, U?> func) where U : class =>
             value is null ? null : func(value);
-
-        public U? Map<U>(Func<T, U> func) where U : class =>
-            value is null ? null : func(value);
-
-        public Nullable<U> MapValue<U>(Func<T, U> func) where U : struct =>
-            value is null ? new Nullable<U>() : new Nullable<U>(func(value));
-
-        public U Match<U>(Func<T, U> onValue, Func<U> onNull) =>
-            value is null ? onNull() : onValue(value);
-    }
-
-    extension<T>(T? value) where T : struct
-    {
-        public U? Bind<U>(Func<T, U?> func) where U : struct =>
-            value.HasValue ? func(value.Value) : null;
-
-        public Nullable<U> Map<U>(Func<T, U> func) where U : struct =>
-            value.HasValue ? new Nullable<U>(func(value.Value)) : new Nullable<U>();
-
-        public U? MapRef<U>(Func<T, U> func) where U : class =>
-            value.HasValue ? func(value.Value) : null;
-
-        public U Match<U>(Func<T, U> onValue, Func<U> onNull) =>
-            value.HasValue ? onValue(value.Value) : onNull();
     }
 }
 ```
 
+With this extension, a 4-step validation staircase:
+
+```csharp
+// Without Bind — staircase of null guards
+var from = AccountId.TryCreate(request.FromAccountId);
+if (from is null) return null;
+var to = AccountId.TryCreate(request.ToAccountId);
+if (to is null) return null;
+var amount = Money.TryCreate(request.Amount, request.CurrencyCode);
+if (amount is null) return null;
+var transfer = Transfer.TryCreateNew(from, to, amount, maxAmount);
+if (transfer is null) return null;
+```
+
+becomes:
+
+```csharp
+// With Bind — left-to-right, short-circuits on first null
+var transfer = AccountId.TryCreate(request.FromAccountId)
+    .Bind(from => AccountId.TryCreate(request.ToAccountId)
+    .Bind(to => Money.TryCreate(request.Amount, request.CurrencyCode)
+    .Bind(amount => Transfer.TryCreateNew(from, to, amount, maxAmount))));
+
+if (transfer is null) return null;
+```
+
+Both produce the same result. The pipeline is not more functional — it is the same imperative logic read left-to-right instead of top-to-bottom.
+
+### MAY
+
+- MAY use `Result<T>` instead of `T?` when the caller needs typed error information — error codes for API responses, field-level validation messages, or structured failure objects. **Rationale**: `T?` can only say "something failed"; `Result<T>` can say *what* failed and let the caller `Match` on success vs failure at the boundary. Only adopt `Result<T>` when the `T?` + `.Bind()` pipeline is insufficient — for most features, `T?` is enough. A minimal `Result<T>` is a sealed class with `IsSuccess`, `Errors` (`IReadOnlyList<string>`), `Bind`, `Map`, and `Match`. See [CSharpFunctionalExtensions](https://github.com/vkhorikov/CSharpFunctionalExtensions) or Zoran Horvat's [Result type video](https://www.youtube.com/watch?v=LXF-rRWaIxc) for mature implementations; the pattern is the same — define a small `Result<T>` inline or pull in a library.
+
+> ⚠️ **Do NOT put I/O inside `.Bind()` or async `.Match()` branches.** Domain validation via `.Bind()` is synchronous — it decides what the domain accepts. Persistence, database calls, and other I/O live *after* the guard clause as imperative `await` statements. See Decision Point 6's default pattern.
+>
+> **Decision guide**: For 1–2 null-checks, use imperative guards. For 3+ sequential `TryCreate` validations where only pass/fail matters, use `.Bind()` on `T?`. When the caller needs error details (HTTP 400 with field names, structured error objects), use `Result<T>`.
 ---
 
 ## Decision Point 6: Designing a Feature Library's Public API
@@ -666,8 +628,7 @@ internal sealed class TransferService(
 >
 > This hybrid pattern is clearer, easier for LLMs to generate correctly, and creates an obvious seam between "what the domain decided" and "what the system did with that decision."
 >
-> For teams with deep functional-programming fluency, the `Checked<T, TProblem>` monad (DP5) can carry richer error context through the pipeline. For the default case, `T?` + guard clause is sufficient and idiomatic.
->
+> For the default case, `T?` + guard clause is sufficient and idiomatic.
 > For simpler cases with 1–2 null-checks, imperative style is acceptable. For 3+ sequential validations, prefer the pipeline.
 
 **File: `FeatureLibraries/Transfers/ServiceCollectionExtensions.cs`** — one-call registration
@@ -702,10 +663,12 @@ public record TransferOptions
 {
     public static TransferOptions Default => new();
 
-    public decimal MaxTransferAmount { get; init; } = 1_000_000m;
-    public int TransferExpiryHours { get; init; } = 24;
+    public decimal MaxTransferAmount { get; set; } = 1_000_000m;
+    public int TransferExpiryHours { get; set; } = 24;
 }
 ```
+
+> ⚠️ Options records use `{ get; set; }` (not `{ get; init; }`) because `IOptions<T>` configuration binding writes via property setters. `init`-only properties silently retain defaults and ignore `appsettings.json` overrides. This is the deliberate exception to the immutability rule in Principle 2 — options are configuration containers, not domain objects.
 
 **File: `Consumer/Program.cs`** — integrating the feature, with optional HTTP exposure
 
@@ -884,13 +847,39 @@ c.Property(x => x.DecimalPlaces)
 - Nest child-entity configuration classes inside the parent aggregate configuration (e.g., `InvoiceConfiguration.InvoiceLineConfiguration`). **Rationale**: Nesting communicates ownership and discoverability — readers find all configuration for an aggregate in one file.
 - Use `builder.HasDiscriminator<string>().HasValue<TSubtype>()` with TPH inheritance for polymorphic aggregates like `Product → Material | Service`. **Rationale**: TPH avoids complex joins; EF Core materializes the correct subtype from the discriminator column in a single table scan.
 - SHOULD decompose composite value objects into private shadow stand-in properties on the entity when the value object serves as a natural key referenced by child entities. **Rationale**: Shadow properties give full column-level control in the Fluent API while keeping the decomposed value object private to the entity. Example: `InvoiceNumber` decomposed into `private int InvoiceYear` and `private int InvoiceSequence`, with `entity.Ignore(e => e.Number)`, shadow properties mapped via `entity.Property<int>("InvoiceYear")`, and a composite alternate key `entity.HasAlternateKey("InvoiceYear", "InvoiceSequence")`. Child entities reference this via `HasForeignKey("InvoiceNumberYear", "InvoiceNumberSequence").HasPrincipalKey("InvoiceYear", "InvoiceSequence")`.
-- SHOULD persist discriminated union state machines (from Decision Point 3) as a JSON column via `ComplexProperty` + `ToJson()` in EF Core 10, or via a custom `ValueConverter` for `nvarchar` columns when query-by-state is infrequent. **Rationale**: `ComplexProperty(b => b.State, c => c.ToJson())` uses the native `json` type on SQL Server 2025/Azure SQL, enables `ExecuteUpdateAsync` on JSON properties, and benefits from EF Core 10's improved JSON materialization. A `ValueConverter` to `nvarchar` remains valid for broader SQL Server compatibility. For high-frequency state queries (e.g., "find all PastDue subscriptions"), MAY alternatively use TPH with a discriminator column — but prefer JSON unless queryability demands it. The converter MUST use `System.Text.Json` and reapply `DateTimeKind.Utc` on any timestamps embedded in the JSON (SQL Server strips `DateTimeKind` on read). Example:
-
+- SHOULD persist discriminated union state machines (from Decision Point 3) using entity-level TPH inheritance via `HasDiscriminator`, not as a JSON column or custom `ValueConverter`. **Rationale**: TPH maps each variant to a row in one table with a discriminator column and separate nullable columns for variant-specific data. This enables `db.Subscriptions.OfType<ActiveSubscription>()` to translate directly to `WHERE Discriminator = 'Active'` — no client-side filtering, no serialization ceremony. See Decision Point 2 for the `Transfer → PendingTransfer | ApprovedTransfer` pattern. Example:
   ```csharp
-  // State serialized to a single nvarchar column; see Decision Point 3 for the variants
-  builder.Property(s => s.State)
-      .HasConversion(new SubscriptionStateConverter());
+  builder.HasDiscriminator<string>("State")
+      .HasValue<TrialingSubscription>("Trialing")
+      .HasValue<ActiveSubscription>("Active")
+      .HasValue<PastDueSubscription>("PastDue")
+      .HasValue<CanceledSubscription>("Canceled")
+      .HasValue<ExpiredSubscription>("Expired");
   ```
+  Variant-specific columns (e.g., `TrialEndDate`, `CanceledOn`) are nullable — only populated for the corresponding variant's rows. Each variant needs a private parameterless constructor chaining to its primary constructor via `this(default!, ...)` for EF Core materialization:
+  ```csharp
+  internal sealed class ActiveSubscription(/* params */) : Subscription(/* base params */)
+  {
+      private ActiveSubscription() : this(default!, default!, default!, default!, default) { }
+  }
+  ```
+  > ⚠️ **State transitions with TPH are delete-and-insert, not property assignment.** Since the CLR type changes (e.g., `ActiveSubscription` → `CanceledSubscription`), you cannot mutate in place. Load the entity, call the variant's transition method to create a new instance of the target type, then `db.Remove(old)` + `db.Add(new)` + `SaveChangesAsync()`. See Decision Point 2's `PendingTransfer.AddApproval()` for the return-new-instance pattern.
+  >
+  > ⚠️ **EF Core cannot bind `ComplexProperty` parameters in primary constructors.** When a subtype's primary constructor includes a `Money` or other `ComplexProperty`-mapped value object, EF Core's `ConstructorBindingConvention` throws "No suitable constructor was found ... Cannot bind 'planPriceSnapshot'." Every subtype needs a private parameterless constructor with a `this(default!, ...)` initializer so EF Core can materialize via the parameterless ctor and set properties afterward.
+- SHOULD use `[JsonDerivedType]` + `[JsonPolymorphic]` attributes when discriminated union data crosses an external boundary (HTTP API, message bus, external system) and must be serialized to/from JSON. **Rationale**: System.Text.Json does not serialize `abstract record` hierarchies by default — without attributes, `JsonSerializer.Serialize(state)` emits `{}`, losing the type discriminator and all variant data. Annotate the union root and each variant:
+  ```csharp
+  using System.Text.Json.Serialization;
+
+  [JsonPolymorphic(TypeDiscriminatorPropertyName = "type")]
+  [JsonDerivedType(typeof(Trialing), "Trialing")]
+  [JsonDerivedType(typeof(Active), "Active")]
+  [JsonDerivedType(typeof(PastDue), "PastDue")]
+  [JsonDerivedType(typeof(Canceled), "Canceled")]
+  [JsonDerivedType(typeof(Expired), "Expired")]
+  internal abstract record SubscriptionState;
+  ```
+  With these attributes, `JsonSerializer.Serialize(state, options)` and `JsonSerializer.Deserialize<SubscriptionState>(json, options)` round-trip the full hierarchy automatically — no custom `JsonConverter` needed. See [polymorphic serialization docs](https://learn.microsoft.com/en-us/dotnet/standard/serialization/system-text-json/polymorphism).
+  > ⚠️ If a timestamp is embedded in the JSON, reapply `DateTimeKind.Utc` after deserialization — SQL Server and JSON both strip `DateTimeKind` on read.
 
 ### MAY
 - Consolidate all configuration inline in `OnModelCreating` (skipping `IEntityTypeConfiguration<T>`) for simple schemas with few entities. **Rationale**: For small projects, the ceremony of separate configuration files outweighs the organizational benefit.
@@ -981,12 +970,16 @@ Handler methods receive `IDbContextFactory<T>` via DI, then create a short-lived
 - Place entity configuration in `Data/EntityConfiguration/` — one `IEntityTypeConfiguration<T>` file per entity, applied via `modelBuilder.ApplyConfiguration()` in `OnModelCreating()`. **Rationale**: Keeps mapping logic separate from the `DbContext` and the domain model, so neither knows about the other.
 - For multi-entity write operations, wrap in a transaction: `await using var tx = await db.Database.BeginTransactionAsync(ct);` and commit/rollback explicitly. **Rationale**: Multiple `SaveChangesAsync` calls without a transaction boundary leave the database in an inconsistent state on partial failure.
 - Handle `DbUpdateConcurrencyException` at the service layer when optimistic concurrency conflicts occur. Retry or surface the conflict to the caller as a recoverable failure. **Rationale**: Line-of-business applications with concurrent editors need explicit conflict resolution; silent overwrites are unacceptable.
+- ⚠️ **`is` pattern matching and `OfType<T>()` do not translate to SQL when the property is mapped via `ValueConverter`.** EF Core stores a primitive (e.g., `string`) but materializes a complex CLR type. `db.Invoices.Where(i => i.Status is Draft)` fails at runtime with "could not be translated." Use one of:
+  1. Query by the stored primitive value directly (add a shadow discriminator property and filter on it).
+  2. `ToListAsync()` then filter client-side with `.Where(i => i.Status is Draft)`.
+  3. Restructure as entity-level TPH (see Decision Point 8) — `db.Subscriptions.OfType<ActiveSubscription>()` on the `DbSet` translates to `WHERE Discriminator = 'Active'` because EF Core knows the discriminator column.
 
 ### MAY
 - For large projects with many query paths, extract complex read queries into dedicated query classes in `Data/Queries/` that take `DbContext` as a dependency. **Rationale**: Prevents the `DbContext` class itself from accumulating query logic.
 - Use `.NET 10` `LeftJoin` and `RightJoin` LINQ operators for outer-join queries — `db.Students.LeftJoin(db.Departments, s => s.DepartmentId, d => d.Id, (s, d) => new { s.Name, Dept = d.Name ?? "[NONE]" })`. **Rationale**: .NET 10 first-class `LeftJoin`/`RightJoin` replaces the old `GroupJoin` + `SelectMany` + `DefaultIfEmpty` ceremony; EF Core 10 translates these directly to SQL `LEFT JOIN` / `RIGHT JOIN`.
 - Use `ExecuteUpdateAsync` with a regular (non-expression) lambda when building dynamic update setters — `await db.Blogs.ExecuteUpdateAsync(s => { s.SetProperty(b => b.Views, 8); if (nameChanged) s.SetProperty(b => b.Name, "foo"); })`. **Rationale**: EF Core 10 accepts a statement lambda, eliminating the expression-tree construction ceremony required in EF Core 9 and earlier.
-- Use EF Core 10 `ExecuteUpdateAsync` to bulk-update properties inside JSON columns mapped via `ComplexProperty` + `ToJson()` — `await db.Blogs.ExecuteUpdateAsync(s => s.SetProperty(b => b.Details.Views, b => b.Details.Views + 1))`. **Rationale**: EF Core 10 translates JSON property updates to efficient SQL (e.g., `JSON_MODIFY` or the new `modify()` method on SQL Server 2025 `json` type).
+- Use EF Core 10 `ExecuteUpdateAsync` to bulk-update properties inside JSON columns mapped via `ComplexProperty` + `ToJson()` — `await db.Blogs.ExecuteUpdateAsync(s => s.SetProperty(b => b.Details.Views, b => b.Details.Views + 1))`. **Rationale**: EF Core 10 translates JSON property updates to efficient SQL (e.g., `JSON_MODIFY` or the new `modify()` method on SQL Server 2025 `json` type). This applies to value-object JSON columns (e.g., `BlogDetails`); for state machine persistence, use entity-level TPH with `HasDiscriminator` — see Decision Point 8.
 
 ---
 
@@ -1338,7 +1331,7 @@ internal class Invoice(
         get;
         init => field = !string.IsNullOrEmpty(customerName) ? customerName
             : throw new ArgumentException("Customer name cannot be null or empty.", nameof(customerName));
-    }
+    } = customerName;
 
     private List<InvoiceLine> _lines = new();
     public IReadOnlyCollection<InvoiceLine> Lines
@@ -1441,7 +1434,7 @@ When you encounter a concept not shown in the examples, derive the correct patte
 
 **To model a new state machine** (e.g., `OrderStatus`, `PaymentState`):
 1. Root: `internal abstract record BaseType;`
-2. Variants: `sealed record VariantName(...) : BaseType;`
+2. Variants: prefer non-positional record syntax with an explicit parameterless constructor for EF Core materialization and a domain constructor for normal instantiation. Positional records (`sealed record VariantName(DateTime Date) : BaseType`) work for primitive-only parameters in EF Core 8+ but fail when variants carry complex-type parameters (issue #31621, still open), create `with`-expression identity-tracking conflicts, and trigger a compiler-generated copy constructor that adds noise to EF Core binding errors. See Decision Point 8 for the full pattern and TPH configuration.
 3. Group capabilities with marker interfaces
 4. All variant dispatch via exhaustive switch pattern matching
 5. For value-based dispatch within states, use property patterns with `when` guards (Decision Point 4)
@@ -1459,6 +1452,16 @@ When you encounter a concept not shown in the examples, derive the correct patte
 3. Value object used as `ComplexProperty` → add `private` parameterless constructor with `default!` chaining
 4. If the value object wraps `DateTime` → reapply `DateTimeKind` in the converter (SQL Server strips it)
 5. If object properties depend on other properties → null-conditional guard for EF Core materialization ordering
+
+**To map a new state machine to EF Core** (persisting a discriminated union like `OrderStatus` or `PaymentState`):
+1. Use entity-level TPH inheritance with `HasDiscriminator<string>()` — declare a custom discriminator column name (avoid the default `"Discriminator"` column name on EF Core 10 due to [regression #37571](https://github.com/dotnet/efcore/issues/37571); fixed in 10.0.5). Call `UseTphMappingStrategy()` explicitly on the root entity for clarity.
+2. Use non-positional record syntax for variants (see "To model a new state machine" above) — provides a parameterless constructor for EF Core materialization and avoids complex-type parameter binding failures (issue #31621).
+3. Register ALL derived variant types in the model — EF Core does not auto-discover subtypes. Each variant needs its own `IEntityTypeConfiguration<T>` (or inline `modelBuilder.Entity<Variant>(...)`).
+4. Map same-named properties across sibling variants to shared columns via `HasColumnName("StateDate1")` — without this, EF Core creates separate prefixed columns per variant.
+5. Add a concurrency token (`IsRowVersion()`) — state machines with concurrent transitions have race conditions. EF Core throws `DbUpdateConcurrencyException` on version mismatch.
+6. Prefer `DateTimeOffset` for `DateTime` properties — the database stores the UTC offset automatically, eliminating the need for a per-property `ValueConverter<DateTime, DateTime>` to reapply `DateTimeKind.Utc`. If `DateTime` is unavoidable, apply the converter globally via `ConfigureConventions` instead of per-property.
+7. Consider a separate state table with an FK back to the aggregate, rather than embedding the TPH hierarchy directly in the aggregate table — keeps the aggregate lean and the state table independently testable.
+8. Do NOT use `ComplexProperty` + `ToJson()` or `ValueConverter<string>` with `JsonSerializer` for entity state machines — EF Core 10 does not support complex type inheritance (issue #31250), and JSON serialization prevents SQL-level queries on variant-specific properties.
 
 **When in doubt between `record` and `class`**:
 - Prefer `record` — for values, DTOs, and discriminated unions
