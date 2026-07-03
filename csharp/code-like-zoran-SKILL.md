@@ -1,6 +1,6 @@
 ---
 name: "zoran"
-version: "4.4"
+version: "4.7"
 runtime: "required .NET 10 / C# 14 / EF Core 10 / self-hosted Microsoft SQL Server 2022"
 status: "production baseline — fixed SQL Server 2022 compatibility level 160"
 summary: "Generate clear C# for domain-heavy applications: explicit domain concepts, immutable values, behaviour-led aggregates, deliberate boundaries, and EF Core mappings that respect the model."
@@ -36,11 +36,13 @@ options.UseSqlServer(
     sql => sql.UseCompatibilityLevel(160));
 ```
 
-Database deployment artefacts are outside this skill.
-
 ### Production safety gate
 
 A feature marked preview in the applicable Microsoft documentation is never a default in production-targeted code. Introduce it only when the task explicitly confirms feature-specific operational approval. Do not infer approval from the fixed platform baseline, compatibility level, or the presence of related APIs.
+
+### Dependency gate
+
+When changing packages, use the current stable version compatible with the fixed platform. Stay on EF Core 10, avoid prereleases without explicit approval, keep direct `Microsoft.EntityFrameworkCore.*` references version-aligned, verify extension compatibility, and do not upgrade packages incidentally.
 
 Apply rules in this order:
 
@@ -183,7 +185,8 @@ public sealed record DateRange
 
 ### 4.3 Money, time, identifiers, and calendars
 
-- Model money as an amount plus currency. Do not pass bare `decimal` amounts across a meaningful domain boundary.
+- Model money as an amount plus currency. Do not pass bare `decimal` amounts across a meaningful domain boundary. A general `Money` type should not acquire a non-negative rule, a fixed scale, or an invoice-only rounding rule unless every valid use shares it; credits, refunds, adjustments, prices, and settlement amounts may require different constraints. Put those constraints on the relevant operation or a more specific type.
+- A three-character currency string is not proof that a value is an ISO 4217 code. Validate only the syntax you can prove, or validate membership against a deliberately versioned approved-code source when that is a requirement. Do not describe a length-only check as ISO validation.
 - Use `DateOnly` for dates without a time or zone and `TimeOnly` for a time-of-day. Use `DateTimeOffset` for an instant; normalise to UTC where that is a domain invariant.
 - Use `TimeProvider` or a timestamp supplied by the application service for current time when deterministic testing or auditability matters.
 - Use `ISOWeek` only where the business specification actually uses ISO 8601 weeks. Do not substitute ISO rules for fiscal or locale-specific calendars.
@@ -285,15 +288,23 @@ public SubscriptionPlan Plan { get; private set; } = null!;
 
 Navigations are a persistence-facing convenience, not a prerequisite for `HasOne<TPrincipal>().WithMany().HasForeignKey(...)`. Keep them out of domain behaviour unless traversal itself is part of a business rule. A foreign-key-only relationship cannot be traversed with `Include`, and relationship fix-up has no navigation property to update.
 
-Use a private `List<T>` and expose a read-only view for child entities. Do not return the mutable list itself. Use `private set` for state changed by aggregate methods. Do not create public setters merely to satisfy persistence.
+When a reference points to an aggregate in another bounded context or external service, keep it as a scalar value-object identifier and do not configure an EF relationship to a principal that is absent from the model. Its existence and authorisation are application-boundary concerns.
 
-Each behaviour method must validate the whole proposed state before mutation where fields constrain one another. Use named methods that describe the transition; do not expose generic setters or a public `Validate` method.
+Use a private `List<T>` and expose a read-only view for child entities. Do not return the mutable list itself. EF Core can use a conventionally named backing field for a read-only collection navigation, but cover materialisation and relationship fix-up with an integration test. Use `private set` for state changed by aggregate methods. Do not create public setters merely to satisfy persistence.
+
+An aggregate root is a write boundary, even when a child has its own key and an ordinary EF entity mapping. Load and mutate a child through its root for commands; a child table may still be queried directly for a read projection. A public `DbSet<TChild>` is not a licence for application commands to bypass aggregate behaviour.
+
+Use a domain foreign-key property when the child must reason about, report on, authorise against, or correlate its parent. A shadow foreign key is suitable only when that association is purely persistence metadata. When using one deliberately, configure its type, conversion, index, and column name explicitly rather than relying on a string literal and convention.
+
+Each behaviour method must validate the whole proposed state before mutation where fields constrain one another. Use named methods that describe the decision or transition; do not expose generic `Set...` methods for business state. A temporal transition must receive the facts needed to prove it is valid—such as an assessment time, due date, billing boundary, or prior event—and validate chronological order and permitted status. Do not provide `MarkOverdue()` or `SetCurrentPeriodEnd(...)` merely because a caller needs a setter when the actual policy has not been specified.
 
 Whether a repeated command is a no-op, rejection, or a separate auditable action is a business decision. State that policy explicitly.
 
 ### 5.2 Historical terms and commitments
 
 When an aggregate creates a commitment whose terms must remain historically true, model those terms deliberately: reference an immutable or versioned record, or store an immutable snapshot. Typical terms include price, tariff, tax treatment, billing cadence, entitlement, exchange rate, and contractual wording.
+
+When an aggregate creates a commitment, decide explicitly whether it refers to current reference data or preserves a versioned or snapshotted set of terms. A completed or issued business record must retain the values, conditions, and authority that were effective when it was created. Where an exceptional adjustment is permitted, model it as a separately named and authorised operation with its reason or source; do not admit arbitrary changes through an ordinary command.
 
 Apply this only where the business meaning is a commitment or historical fact rather than a live view of current reference data.
 
@@ -392,7 +403,11 @@ At an application boundary:
 5. persist within the appropriate unit of work;
 6. map to a stable public result.
 
-Return `Rejected` for expected business-rule failures and `Conflict` for an expected stale-write outcome. Catch `DbUpdateConcurrencyException` only to produce a meaningful conflict result. Let database outages, timeouts, programming defects, and other unexpected technical faults reach the host exception boundary.
+An interface, DTOs, and entity mappings are not a completed use case. Unless the task explicitly asks for contracts only, implement the command handler or application service, its persistence boundary, and focused tests. Do not leave a public command contract with no code that validates input, loads state, invokes the aggregate, saves, and maps the outcome.
+
+Return `Rejected` for expected business-rule failures and `Conflict` for an expected stale-write outcome. Catch `DbUpdateConcurrencyException` only to produce a meaningful conflict result. A unique-key violation is provider-specific and is not a `DbUpdateConcurrencyException`; where a unique rule is part of the public contract, name the database constraint or index deterministically and translate only that known violation to the appropriate `Conflict` or `Rejected` result. Do not turn every `DbUpdateException` into a client error. Let database outages, timeouts, programming defects, and other unexpected technical faults reach the host exception boundary.
+
+A SQL Server `rowversion` detects stale tracked writes, but it is not automatically a client-side conditional-update protocol. Where clients edit a representation and stale overwrites matter, deliberately expose and require an opaque revision or HTTP ETag, or state why server-side conflict detection alone is sufficient.
 
 Log technical faults, audit events, and security-relevant decisions through the host's structured logging policy. Do not log secrets or treat every expected rejection as an error.
 
@@ -441,6 +456,8 @@ Configure owned and complex members inside the configuration class for their own
 
 Inline `OnModelCreating` code remains reasonable for a genuinely tiny model or a focused documentation example, but should not be the production default.
 
+Configure the provider, connection string, and `UseCompatibilityLevel(160)` in the composition root, normally through `AddDbContext`. The `UseSqlServer` overload without a connection string is valid for a context whose connection is supplied later, but it is not a normal replacement for host configuration: a connection must be set before the context uses the database. Do not put a placeholder provider configuration in `OnConfiguring` and imply that the context is runnable on its own.
+
 Do not wrap `DbContext` in a generic repository that only re-exposes `DbSet` methods. Use `DbContext` directly in straightforward application services. Add a focused repository or query gateway only when it creates a real boundary, such as a provider-independent read model, a complex query policy, or an external persistence port.
 
 ### 9.2 Choose the appropriate mapping
@@ -461,7 +478,7 @@ When a value beneath an owned entity would otherwise be a complex property, choo
 | Requirement | Mapping choice | Consequence |
 |---|---|---|
 | Keep the line owned and store the nested value in relational columns | Use `OwnsOne` for the nested value | The nested value becomes an owned entity in EF's model, with ownership identity and entity-style tracking. It normally remains table-split into the line table. |
-| Keep the nested value as a true EF complex property | Map the containing line as a normal dependent entity, then configure `ComplexProperty` on its `EntityTypeBuilder<InvoiceLine>` | The line now has ordinary entity and relationship semantics; model and migration changes are intentional. |
+| Keep the nested value as a true EF complex property | Map the containing line as a normal dependent entity, then configure `ComplexProperty` on its `EntityTypeBuilder<InvoiceLine>` | The line now has ordinary entity and relationship semantics; the relational mapping change is intentional. |
 | Treat the nested value as one self-contained persisted unit | Redesign it as a single-column converted value or self-contained JSON document | This can weaken relational querying and database constraints; use it only where the component's lifecycle and query needs fit. |
 
 The first option is usually the smallest change when the containing line is already owned. For example:
@@ -482,7 +499,7 @@ builder.OwnsMany(invoice => invoice.Lines, line =>
 });
 ```
 
-This makes `Money` an owned entity in EF's model. Cover the mapping, migration, and replacement behaviour with an integration test. Choose the normal-entity or converted/document alternative only where its semantic and operational trade-offs fit the domain.
+This makes `Money` an owned entity in EF's model. Cover the mapping and replacement behaviour with an integration test. Choose the normal-entity or converted/document alternative only where its semantic and operational trade-offs fit the domain.
 
 Choose explicit column names that are unique and intelligible within the physical table. `TotalAmount` is not invalid merely because it matches its parent complex property name: the parent is not itself a scalar column. However, `TotalAmount_Amount` or another distinctive name usually makes the schema easier to read. In EF Core 10, accidental duplicate complex-property column names are uniquified rather than silently sharing a column; intentionally shared columns require explicit configuration. Do not rely on generated suffixes as a naming convention.
 
@@ -550,7 +567,9 @@ An immutable converted class with correct value equality normally needs no custo
 
 Use a unique index when a value must only be unique. Use an alternate key, with `HasPrincipalKey` where needed, when a dependent relationship must reference that business key. A relationship's principal key must be a primary or alternate key; a unique index alone is not sufficient.
 
-Configure required uniqueness and referential integrity deliberately. Application pre-checks do not prevent races.
+Configure required uniqueness and referential integrity deliberately. Application pre-checks do not prevent races. When a unique rule is user-visible, give the index or constraint a stable database name and decide how the application maps its known violation.
+
+Choose `DeleteBehavior` deliberately for every relationship whose dependents have material business, audit, or retention value. Required relationships conventionally cascade; do not let that default delete invoices, payments, ledger entries, or audit records merely because they are dependent in the object graph. Use `Restrict` or `NoAction`, plus an explicit domain lifecycle such as voiding or archival, unless deletion is an established retention rule. Test the chosen delete behaviour against SQL Server.
 
 Keep nullable reference types enabled. C# nullability affects EF Core's required/optional conventions, so review resulting warnings and column nullability whenever a property changes.
 
@@ -628,7 +647,7 @@ At level 160, parameter-sensitive plan optimisation and cardinality-estimation f
 
 SQL Server 2022 provides textual JSON support at this level. JSON documents are stored in `nvarchar` or `varchar` columns and can be validated, queried, transformed, and modified with `ISJSON`, `JSON_VALUE`, `JSON_QUERY`, `JSON_MODIFY`, and `OPENJSON`.
 
-Under `UseCompatibilityLevel(160)`, EF Core 10 maps JSON-backed complex types, owned JSON components, and primitive collections to `nvarchar(max)`, not to a native `json` column. `ToJson()` is permissible only for a self-contained component that is normally read and written together and does not need relational joins, constraints, reporting, or an independent lifecycle. Test representative migrations, generated SQL, reads, writes, updates, and queries against the target database.
+Under `UseCompatibilityLevel(160)`, EF Core 10 maps JSON-backed complex types, owned JSON components, and primitive collections to `nvarchar(max)`, not to a native `json` column. `ToJson()` is permissible only for a self-contained component that is normally read and written together and does not need relational joins, constraints, reporting, or an independent lifecycle. Test representative generated SQL, reads, writes, updates, and queries against the target database.
 
 Do not generate later-engine JSON facilities, including the native `json` type, `CREATE JSON INDEX`, `JSON_CONTAINS`, JSON aggregate functions, the `JSON_VALUE ... RETURNING` form, or the `json` type's `modify()` method. For frequently filtered or sorted JSON paths, consider an indexed computed column based on `JSON_VALUE` only after execution-plan evidence demonstrates the need. Where JSON can be written outside EF Core's mapped model, enforce validity with an appropriate `ISJSON` check constraint or equivalent database-side control.
 
@@ -649,6 +668,8 @@ Test at the relevant levels:
 Instantiate aggregates in domain tests; do not mock their behaviour. Fake or mock external boundaries only when it makes a test narrower and clearer.
 
 Use a test against the actual SQL Server 2022 compatibility-level-160 target for provider-specific mappings and important queries. For JSON, verify representative schema, generated SQL, writes, updates, and queries. For published HTTP APIs, test important request/response payloads, status codes, and OpenAPI output.
+
+For an aggregate with converted keys, complex values, private collection fields, concurrency tokens, or non-default delete behaviour, include a provider integration test that builds the model, initialises an isolated SQL Server test schema, round-trips a fresh context, verifies relationship fix-up/materialisation, and proves the expected concurrency and deletion outcomes. Isolate write tests with transactions or independent databases; do not substitute an in-memory provider for SQL Server-specific mapping tests.
 
 Test names should describe behaviour. Arrange/Act/Assert comments are optional; use them only when they make a long test clearer.
 
@@ -672,18 +693,19 @@ For each task:
 2. Identify the business invariant or boundary involved. Do not create an abstraction without a concrete reason.
 3. Choose the smallest fitting model: primitive, value object, enum, state object, entity, DTO, or projection.
 4. Keep domain behaviour in the aggregate; keep I/O and orchestration in application or infrastructure code.
-5. Use the fixed .NET 10 / C# 14 / EF Core 10 / SQL Server 2022 compatibility-level-160 baseline.
-6. Write explicit mappings at HTTP, JSON, EF Core, and external-service boundaries.
+5. Use the fixed .NET 10 / C# 14 / EF Core 10 / SQL Server 2022 compatibility-level-160 baseline, with current stable EF Core 10 package references where a package change is required.
+6. Write explicit mappings at HTTP, JSON, EF Core, and external-service boundaries; identify the composition root and test target for any persistent-model change.
 7. Pass cancellation through asynchronous I/O.
-8. Add or update focused tests that prove the important rule, mapping, or provider behaviour.
-9. Re-read public signatures for accessibility, nullability, cancellation, accidental domain leakage, and any preview feature; require explicit operational approval before adding one.
+8. Implement the relevant application command unless contracts only were explicitly requested; add or update focused tests that prove the important rule, mapping, or provider behaviour.
+9. Re-read public signatures for accessibility, nullability, cancellation, accidental domain leakage, incomplete public command contracts, and any preview feature; require explicit operational approval before adding one.
 
 ## 15. Final checklist
 
 Before returning code, verify only the items relevant to the change:
 
 - [ ] The code targets .NET 10, C# 14, EF Core 10, and self-hosted SQL Server 2022 at compatibility level 160.
-- [ ] SQL Server options configure `UseCompatibilityLevel(160)`.
+- [ ] Package changes use the current stable EF Core 10 servicing release; prerelease packages have explicit operational approval, direct EF Core package versions are identical, and extension packages are EF Core 10-compatible.
+- [ ] SQL Server options configure `UseCompatibilityLevel(160)` in the composition root with a real connection configuration before database use.
 - [ ] Every public signature uses only accessible public types.
 - [ ] DTOs, entities, and value objects are not conflated.
 - [ ] The model is proportionate to the feature; CRUD-only and read-side work has not acquired domain ceremony without a concrete invariant or policy.
@@ -693,6 +715,8 @@ Before returning code, verify only the items relevant to the change:
 - [ ] A scalar value object uses an inline converter unless shared reuse, mapping hints, or conversion complexity justifies a converter class.
 - [ ] Entity mappings use `IEntityTypeConfiguration<T>` classes unless the model is genuinely trivial; owned and complex members remain configured under their owner.
 - [ ] Relationship navigations are chosen deliberately: foreign-key-only mappings use generic `HasOne<T>()` or `HasMany<T>()` and parameterless `WithMany()` or `WithOne()`.
+- [ ] Child entities remain inside their aggregate's command boundary; intentional shadow foreign keys are explicitly typed, converted, named, and covered by an integration test.
+- [ ] Delete behaviour is explicit, and historical, financial, or audit dependents cannot be cascaded away without an established retention rule.
 - [ ] A complex value nested beneath an owned entity uses an intentional owned-entity, converted-column, JSON, or normal-entity design; it does not call unavailable `ComplexProperty` APIs on `OwnedNavigationBuilder`.
 - [ ] A persisted calculated complex value is established by constructors and state transitions; no fabricated default merely suppresses nullable warnings.
 - [ ] A domain `Id` is the primary key unless distinct domain and storage identities are required.
@@ -700,7 +724,9 @@ Before returning code, verify only the items relevant to the change:
 - [ ] Entity inheritance, where genuinely needed, uses an explicit shadow discriminator with stable values; `UseTphMappingStrategy()` is not added merely to restate the default.
 - [ ] Economically meaningful decimals have explicit, appropriate precision and scale.
 - [ ] `DbContext` is short-lived and never shared concurrently.
-- [ ] Expected business rejection, optimistic-concurrency conflict, and unexpected technical failure remain distinct.
+- [ ] Expected business rejection, unique-constraint conflict, optimistic-concurrency conflict, and unexpected technical failure remain distinct.
+- [ ] A public command has an implementation and focused tests unless contracts-only output was expressly requested.
+- [ ] A client-facing update has an explicit concurrency policy (such as opaque revision/ETag or stated server-side handling) where stale overwrites matter.
 - [ ] Bulk updates, query-filter bypasses, and raw SQL have explicit security, audit, transaction, and concurrency implications.
 - [ ] JSON and validation concerns have not leaked into the domain merely for transport convenience.
 - [ ] JSON mappings use `nvarchar(max)` storage; any JSON-path indexing uses an evidenced computed-column design, and later-engine JSON facilities are not generated.
@@ -727,11 +753,15 @@ Use the current applicable Microsoft documentation when a framework or provider 
 - EF Core inheritance and discriminators: https://learn.microsoft.com/ef/core/modeling/inheritance
 - EF Core keys and relationships: https://learn.microsoft.com/ef/core/modeling/relationships/foreign-and-principal-keys
 - EF Core `DbContext` lifetime: https://learn.microsoft.com/ef/core/dbcontext-configuration
+- EF Core SQL Server provider: https://learn.microsoft.com/ef/core/providers/sql-server/
 - EF Core concurrency: https://learn.microsoft.com/ef/core/saving/concurrency
 - EF Core transactions: https://learn.microsoft.com/ef/core/saving/transactions
 - EF Core bulk updates: https://learn.microsoft.com/ef/core/saving/execute-insert-update-delete
 - EF Core global query filters: https://learn.microsoft.com/ef/core/querying/filters
 - EF Core testing: https://learn.microsoft.com/ef/core/testing/choosing-a-testing-strategy
+- EF Core testing against the production database system: https://learn.microsoft.com/ef/core/testing/testing-with-the-database
+- EF Core NuGet packages: https://learn.microsoft.com/ef/core/what-is-new/nuget-packages
+- EF Core SQL Server NuGet package: https://www.nuget.org/packages/Microsoft.EntityFrameworkCore.SqlServer/
 - SQL Server compatibility levels: https://learn.microsoft.com/sql/t-sql/statements/alter-database-transact-sql-compatibility-level
 - SQL Server 2022 features: https://learn.microsoft.com/sql/sql-server/what-s-new-in-sql-server-2022
 - Work with JSON data in SQL Server: https://learn.microsoft.com/sql/relational-databases/json/json-data-sql-server
