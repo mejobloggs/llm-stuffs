@@ -1,6 +1,6 @@
 ---
 name: "zoran"
-version: "4.3"
+version: "4.4"
 runtime: "required .NET 10 / C# 14 / EF Core 10 / self-hosted Microsoft SQL Server 2022"
 status: "production baseline — fixed SQL Server 2022 compatibility level 160"
 summary: "Generate clear C# for domain-heavy applications: explicit domain concepts, immutable values, behaviour-led aggregates, deliberate boundaries, and EF Core mappings that respect the model."
@@ -54,6 +54,12 @@ Do not invent business rules. Represent a rule only when the task, tests, schema
 When repository files, database configuration, or tests are not available, state assumptions. Never claim to have inspected or executed anything that was not available.
 
 ## 2. Core principles
+
+### Scope and proportionality
+
+Use this skill proportionately. For a CRUD-heavy feature or read-side projection with no material domain invariant, state transition, historical commitment, or cross-record consistency rule, prefer straightforward entities, DTO projections, and local validation; do not introduce value-object identifiers, aggregates, `ServiceResult<T>`, or separate configuration classes merely to satisfy a pattern. Retain the platform, security, data-integrity, boundary, and testing rules that remain relevant.
+
+Escalate to richer domain modelling when named concepts prevent material mistakes, behaviour must preserve an invariant, a business transition needs an explicit policy, or historical terms and concurrent updates matter.
 
 ### 2.1 Give important concepts names
 
@@ -450,7 +456,15 @@ Do not wrap `DbContext` in a generic repository that only re-exposes `DbSet` met
 
 **Nested-owned limitation.** In EF Core 10, `ComplexProperty` is exposed by `EntityTypeBuilder<T>`, not by the `OwnedNavigationBuilder<TOwner, TDependent>` supplied to an `OwnsOne` or `OwnsMany` callback. A complex type therefore cannot be configured beneath an owned entity with that Fluent API. The limitation is unrelated to records, get-only properties, `IReadOnlyCollection<T>`, or record value equality. An explicit generic `OwnsMany` overload still supplies an `OwnedNavigationBuilder`; it does not alter this limitation.
 
-For a value nested in an owned entity, use `OwnsOne` deliberately:
+When a value beneath an owned entity would otherwise be a complex property, choose deliberately:
+
+| Requirement | Mapping choice | Consequence |
+|---|---|---|
+| Keep the line owned and store the nested value in relational columns | Use `OwnsOne` for the nested value | The nested value becomes an owned entity in EF's model, with ownership identity and entity-style tracking. It normally remains table-split into the line table. |
+| Keep the nested value as a true EF complex property | Map the containing line as a normal dependent entity, then configure `ComplexProperty` on its `EntityTypeBuilder<InvoiceLine>` | The line now has ordinary entity and relationship semantics; model and migration changes are intentional. |
+| Treat the nested value as one self-contained persisted unit | Redesign it as a single-column converted value or self-contained JSON document | This can weaken relational querying and database constraints; use it only where the component's lifecycle and query needs fit. |
+
+The first option is usually the smallest change when the containing line is already owned. For example:
 
 ```csharp
 builder.OwnsMany(invoice => invoice.Lines, line =>
@@ -468,7 +482,7 @@ builder.OwnsMany(invoice => invoice.Lines, line =>
 });
 ```
 
-This makes `Money` an owned entity in EF's model, with an ownership identity and entity-style tracking. It normally remains table-split into the line table, so it need not create a separate database table; nevertheless, its model semantics differ from a true complex property. Cover the mapping, migration, and replacement behaviour with an integration test. Where those semantics are unacceptable, make the line a normal mapped entity so that its `EntityTypeBuilder<InvoiceLine>` can use `ComplexProperty`, or redesign the persisted component as a single-column converted value or self-contained JSON document where that is genuinely appropriate.
+This makes `Money` an owned entity in EF's model. Cover the mapping, migration, and replacement behaviour with an integration test. Choose the normal-entity or converted/document alternative only where its semantic and operational trade-offs fit the domain.
 
 Choose explicit column names that are unique and intelligible within the physical table. `TotalAmount` is not invalid merely because it matches its parent complex property name: the parent is not itself a scalar column. However, `TotalAmount_Amount` or another distinctive name usually makes the schema easier to read. In EF Core 10, accidental duplicate complex-property column names are uniquified rather than silently sharing a column; intentionally shared columns require explicit configuration. Do not rely on generated suffixes as a naming convention.
 
@@ -672,6 +686,7 @@ Before returning code, verify only the items relevant to the change:
 - [ ] SQL Server options configure `UseCompatibilityLevel(160)`.
 - [ ] Every public signature uses only accessible public types.
 - [ ] DTOs, entities, and value objects are not conflated.
+- [ ] The model is proportionate to the feature; CRUD-only and read-side work has not acquired domain ceremony without a concrete invariant or policy.
 - [ ] Domain invariants are enforced at construction and every state change.
 - [ ] A constrained record has get-only properties; `with` cannot bypass a cross-field invariant.
 - [ ] No `Empty` identifier sentinel, `FromStorage` factory, or post-construction validity ritual has been introduced.
