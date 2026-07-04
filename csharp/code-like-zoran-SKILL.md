@@ -1,22 +1,10 @@
 ---
 name: "zoran"
-version: "4.7"
+version: "4.8.3"
 runtime: "required .NET 10 / C# 14 / EF Core 10 / self-hosted Microsoft SQL Server 2022"
 status: "production baseline — fixed SQL Server 2022 compatibility level 160"
-summary: "Generate clear C# for domain-heavy applications: explicit domain concepts, immutable values, behaviour-led aggregates, deliberate boundaries, and EF Core mappings that respect the model."
+summary: "Generate clear C# for domain-heavy applications: explicit domain concepts, immutable values, behaviour-led aggregates, deliberate boundaries, EF Core mappings that respect the model, and real SQL Server provider tests where they matter."
 ---
-
-> **First run only — verify, then delete this block.**
->
-> Run the following against the target database and confirm that `compatibility_level` is `160`:
->
-> ```sql
-> SELECT name, compatibility_level
-> FROM sys.databases
-> WHERE name = DB_NAME();
-> ```
->
-> This skill assumes self-hosted SQL Server 2022 at compatibility level 160.
 
 # Zoran-Inspired C# Domain-Modelling Skill
 
@@ -667,11 +655,80 @@ Test at the relevant levels:
 
 Instantiate aggregates in domain tests; do not mock their behaviour. Fake or mock external boundaries only when it makes a test narrower and clearer.
 
-Use a test against the actual SQL Server 2022 compatibility-level-160 target for provider-specific mappings and important queries. For JSON, verify representative schema, generated SQL, writes, updates, and queries. For published HTTP APIs, test important request/response payloads, status codes, and OpenAPI output.
+Use a real SQL Server database at compatibility level 160 for provider-specific mappings and important queries. For JSON, verify representative schema, generated SQL, writes, updates, and queries. For published HTTP APIs, test important request/response payloads, status codes, and OpenAPI output.
 
 For an aggregate with converted keys, complex values, private collection fields, concurrency tokens, or non-default delete behaviour, include a provider integration test that builds the model, initialises an isolated SQL Server test schema, round-trips a fresh context, verifies relationship fix-up/materialisation, and proves the expected concurrency and deletion outcomes. Isolate write tests with transactions or independent databases; do not substitute an in-memory provider for SQL Server-specific mapping tests.
 
 Test names should describe behaviour. Arrange/Act/Assert comments are optional; use them only when they make a long test clearer.
+
+### 12.1 Real SQL Server integration tests (Testcontainers)
+
+Use a real SQL Server database when a change depends on the SQL Server provider: migrations, mappings, generated SQL, JSON, constraints, collations, transactions, concurrency, delete behaviour, raw SQL, or query translation. EF InMemory and SQLite are not proof of SQL Server behaviour.
+
+For a new test project, use a pinned current-stable **MSTest.Sdk 4.x** project SDK, `Testcontainers.MsSql`, and the same EF Core SQL Server 10.x servicing version as the application. `MSTest.Sdk` uses MTP; do not add direct `MSTest.TestFramework`, `MSTest.TestAdapter`, `MSTest.Analyzers`, or `Microsoft.NET.Test.Sdk` references unless switching deliberately to VSTest. Disable parallel execution for a shared database:
+
+```csharp
+[assembly: DoNotParallelize]
+```
+
+**Fixture pattern**
+
+- Start **one container per test assembly**. A separate test project is a separate assembly and therefore starts its own container. Keep the shared assembly database serial.
+- Put the fixture in a `[TestClass]`. `[AssemblyInitialize]` must be `public static Task` or `ValueTask` with a `TestContext` parameter; `[AssemblyCleanup]` must be `public static Task` or `ValueTask` and await `DisposeAsync()`.
+- Use this exact image and pass it to the constructor; do not use a floating `latest` tag or the obsolete parameterless builder:
+
+```csharp
+private const string SqlServerImage =
+    "mcr.microsoft.com/mssql/server:2025-CU6-ubuntu-24.04";
+
+_container = new MsSqlBuilder(SqlServerImage)
+    .WithCleanUp(true)
+    .Build();
+```
+
+- `GetConnectionString()` initially targets `master`. After `await _container.StartAsync()`, use that connection only to create a unique application database and set its compatibility level **before** applying the schema:
+
+```sql
+ALTER DATABASE [<test-database-name>] SET COMPATIBILITY_LEVEL = 160;
+```
+
+  Build and store a separate connection string whose `Initial Catalog` is that database. Apply migrations, create the schema, seed data, and run tests only through the application-database connection; never target `master`.
+- Use `MigrateAsync()` when production uses EF Core migrations; use `EnsureCreatedAsync()` only for a deliberately migration-free model. Never call both for the same database. Seed a small, read-only baseline after schema creation.
+- Configure every test context with the same level required by this skill:
+
+```csharp
+options.UseSqlServer(
+    connectionString,
+    sql => sql.UseCompatibilityLevel(160));
+```
+
+- Each test creates and disposes its own `DbContext`. Await `StartAsync()`; do not add sleeps, fixed host ports, or generic readiness checks to `MsSqlBuilder`. Never run against a developer, shared, staging, or production database.
+
+The container uses the SQL Server 2025 engine, but compatibility level 160 preserves the SQL Server 2022 database and EF translation target required by this skill. It does not prove every engine-level SQL Server 2022 behaviour; add an exact SQL Server 2022 test target only where that distinction is material.
+
+**Isolation and proof**
+
+A shared container does not make a shared database safe. Ordinary write tests should roll back their transaction or reset changed data. Tests that commit, span several contexts, or test transactions need an independent database or a reliable reset.
+
+A provider integration test must prove all relevant layers:
+
+1. Assert `db.Database.ProviderName` is `Microsoft.EntityFrameworkCore.SqlServer`; query `SERVERPROPERTY('ProductMajorVersion')` and assert `17`; query `sys.databases` for `DB_NAME()` and assert compatibility level `160`.
+2. For material mappings, assert EF model metadata such as table, primary key, precision, relationship, converter, concurrency token, or delete behaviour.
+3. Query SQL Server catalogue views such as `sys.tables`, `sys.key_constraints`, `sys.indexes`, and `sys.foreign_keys` to prove important physical schema facts. EF metadata alone is not a physical-schema assertion.
+4. Seed three to five rows, query them through a fresh `AsNoTracking()` context with deterministic ordering, and assert count and values. For a write path, save, dispose the context, reload with another context, and assert the durable result.
+
+**Rootless Podman on Linux**
+
+Before `dotnet test`, start Podman's user socket and point Testcontainers at it:
+
+```bash
+systemctl --user enable --now podman.socket
+export DOCKER_HOST="unix://${XDG_RUNTIME_DIR}/podman/podman.sock"
+export TESTCONTAINERS_RYUK_DISABLED=true
+dotnet test
+```
+
+`DOCKER_HOST` selects the Testcontainers endpoint; `TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE` does not. When Ryuk is disabled, explicit fixture disposal remains mandatory and CI should clean up abandoned containers after failed runs.
 
 ## 13. Organisation, accessibility, and C# 14 extensions
 
@@ -731,6 +788,13 @@ Before returning code, verify only the items relevant to the change:
 - [ ] JSON and validation concerns have not leaked into the domain merely for transport convenience.
 - [ ] JSON mappings use `nvarchar(max)` storage; any JSON-path indexing uses an evidenced computed-column design, and later-engine JSON facilities are not generated.
 - [ ] Tests cover the domain rule, mapping, or provider behaviour that matters.
+- [ ] SQL Server-specific tests use an isolated Testcontainers database, not EF InMemory or SQLite.
+- [ ] The test project uses a pinned `MSTest.Sdk` 4.x project SDK; direct legacy MSTest and VSTest packages are absent unless VSTest is explicitly required.
+- [ ] The fixture uses `mcr.microsoft.com/mssql/server:2025-CU6-ubuntu-24.04`, `new MsSqlBuilder(image)`, valid public static MSTest assembly lifecycle methods, one container per test assembly, and explicit disposal.
+- [ ] The container's `master` connection is used only to create the unique application database and set compatibility level 160; migrations, schema creation, seed data, and tests use its separate application-database connection string and `UseSqlServer(...UseCompatibilityLevel(160))`.
+- [ ] Schema creation deliberately uses either migrations or `EnsureCreatedAsync`; shared writes roll back or reset, and execution is serial unless databases are independent.
+- [ ] Provider tests prove the provider, engine major version 17, compatibility level 160, important physical schema, and a fresh-context data round trip.
+- [ ] Rootless Podman uses `DOCKER_HOST` for its API socket; Ryuk-disabled runs retain explicit cleanup.
 - [ ] The response does not claim unperformed inspection, execution, or testing.
 
 ## 16. Official reference points
@@ -760,6 +824,14 @@ Use the current applicable Microsoft documentation when a framework or provider 
 - EF Core global query filters: https://learn.microsoft.com/ef/core/querying/filters
 - EF Core testing: https://learn.microsoft.com/ef/core/testing/choosing-a-testing-strategy
 - EF Core testing against the production database system: https://learn.microsoft.com/ef/core/testing/testing-with-the-database
+- MSTest SDK configuration and MTP: https://learn.microsoft.com/dotnet/core/testing/unit-testing-mstest-sdk
+- MSTest lifecycle: https://learn.microsoft.com/dotnet/core/testing/unit-testing-mstest-writing-tests-lifecycle
+- MSTest parallel execution: https://learn.microsoft.com/dotnet/core/testing/unit-testing-mstest-writing-tests-controlling-execution
+- Testcontainers for .NET MSSQL module: https://dotnet.testcontainers.org/modules/mssql/
+- Testcontainers for .NET configuration: https://dotnet.testcontainers.org/custom_configuration/
+- Podman API service and rootless socket: https://docs.podman.io/en/latest/markdown/podman-system-service.1.html
+- SQL Server 2025 on Linux release notes: https://learn.microsoft.com/sql/linux/sql-server-linux-release-notes-2025?view=sql-server-ver17
+- Microsoft SQL Server container tags: https://mcr.microsoft.com/en-us/artifact/mar/mssql/server/tags
 - EF Core NuGet packages: https://learn.microsoft.com/ef/core/what-is-new/nuget-packages
 - EF Core SQL Server NuGet package: https://www.nuget.org/packages/Microsoft.EntityFrameworkCore.SqlServer/
 - SQL Server compatibility levels: https://learn.microsoft.com/sql/t-sql/statements/alter-database-transact-sql-compatibility-level
