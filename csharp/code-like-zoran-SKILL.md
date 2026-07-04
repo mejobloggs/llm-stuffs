@@ -1,6 +1,6 @@
 ---
 name: "zoran"
-version: "4.10.1"
+version: "4.10.2"
 runtime: "required .NET 10 / C# 14 / EF Core 10 / self-hosted Microsoft SQL Server 2022"
 status: "production baseline — fixed SQL Server 2022 compatibility level 160"
 summary: "Generate clear C# for domain-heavy applications: explicit domain concepts, immutable values, behaviour-led aggregates, deliberate boundaries, EF Core mappings that respect the model, and MTP-native real SQL Server tests where provider behaviour matters."
@@ -459,11 +459,14 @@ Do not wrap `DbContext` in a generic repository that only re-exposes `DbSet` met
 | Domain shape | EF Core mapping default |
 |---|---|
 | One domain value stored in one column | `ValueConverter` |
-| Small identity-less value object stored with its owner, with no navigation | `ComplexProperty` |
+| Small identity-less value with direct scalar members, stored with its owner | `ComplexProperty` |
+| Identity-less value containing another mapped value | `ComplexProperty` or owned mapping, with an explicit EF materialisation path |
 | Ownership needing a collection/table, relationship, navigation, or entity semantics | owned entity mapping |
 | Object with independent identity or lifecycle | entity type |
 
 `ComplexProperty` is not a universal replacement for owned entities. Complex types have no identity and do not support navigations. A complex type mapped to JSON can contain a structural collection, but that collection shares the JSON document's lifecycle; do not use it to simulate relationships.
+
+**Nested-value materialisation.** Nested complex types are supported, but EF Core cannot inject a complex or owned member into an enclosing constructor. Thus `PlanSnapshot(Money price, ...)` needs an EF materialisation path—usually a private parameterless constructor plus private setters or backing fields; scalar constructor parameters remain suitable. `OwnsOne` may be chosen for ownership or table-splitting semantics, but does not itself solve constructor binding. Cover this with a fresh-context integration test.
 
 **Nested-owned limitation.** In EF Core 10, `ComplexProperty` is exposed by `EntityTypeBuilder<T>`, not by the `OwnedNavigationBuilder<TOwner, TDependent>` supplied to an `OwnsOne` or `OwnsMany` callback. A complex type therefore cannot be configured beneath an owned entity with that Fluent API. The limitation is unrelated to records, get-only properties, `IReadOnlyCollection<T>`, or record value equality. An explicit generic `OwnsMany` overload still supplies an `OwnedNavigationBuilder`; it does not alter this limitation.
 
@@ -760,6 +763,7 @@ Before returning code, verify only the items relevant to the change:
 - [ ] Child entities remain inside their aggregate's command boundary; intentional shadow foreign keys are explicitly typed, converted, named, and covered by an integration test.
 - [ ] Delete behaviour is explicit, and historical, financial, or audit dependents cannot be cascaded away without an established retention rule.
 - [ ] A complex value nested beneath an owned entity uses an intentional owned-entity, converted-column, JSON, or normal-entity design; it does not call unavailable `ComplexProperty` APIs on `OwnedNavigationBuilder`.
+- [ ] A mapped type containing a nested complex or owned value has an EF materialisation path; its enclosing constructor does not take that nested value as a parameter.
 - [ ] A persisted calculated complex value is established by constructors and state transitions; no fabricated default merely suppresses nullable warnings.
 - [ ] A domain `Id` is the primary key unless distinct domain and storage identities are required.
 - [ ] A unique index is not used where a relationship requires an alternate key.
@@ -794,6 +798,7 @@ Use the current applicable Microsoft documentation when a framework or provider 
 - EF Core constructors: https://learn.microsoft.com/ef/core/modeling/constructors
 - EF Core value conversions: https://learn.microsoft.com/ef/core/modeling/value-conversions
 - EF Core complex types: https://learn.microsoft.com/ef/core/modeling/complex-types
+- EF Core complex-type constructor binding limitation: https://github.com/dotnet/efcore/issues/31621
 - EF Core owned entity types: https://learn.microsoft.com/ef/core/modeling/owned-entities
 - EF Core relationship navigations: https://learn.microsoft.com/ef/core/modeling/relationships/navigations
 - EF Core inheritance and discriminators: https://learn.microsoft.com/ef/core/modeling/inheritance
