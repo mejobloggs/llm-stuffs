@@ -1,6 +1,6 @@
 ---
 name: "zoran"
-version: "4.10.2"
+version: "4.10.4"
 runtime: "required .NET 10 / C# 14 / EF Core 10 / self-hosted Microsoft SQL Server 2022"
 status: "production baseline — fixed SQL Server 2022 compatibility level 160"
 summary: "Generate clear C# for domain-heavy applications: explicit domain concepts, immutable values, behaviour-led aggregates, deliberate boundaries, EF Core mappings that respect the model, and MTP-native real SQL Server tests where provider behaviour matters."
@@ -98,6 +98,8 @@ An enum is suitable when state is merely a label. Use a state object or hierarch
 | Application | Use-case orchestration, authorisation decisions, loading aggregates, result mapping | Duplicated business rules or direct JSON policy |
 | Domain | Value objects, aggregates, business rules, in-memory domain events | `DbContext`, controllers, service location, HTTP, JSON attributes |
 | Infrastructure | EF Core mapping, focused data access ports, external clients, durable message delivery | Business decisions that belong to an aggregate |
+
+A library need not implement every layer. Keep Transport in the executable host. Place application orchestration where its use cases are consumed; keep Domain free of EF Core and host dependencies, and package Infrastructure separately when it is needed by a specific host.
 
 A feature may be a class library with a small public surface, but do not force every feature into exactly one or two interfaces. Expose only the contracts a consumer genuinely needs.
 
@@ -721,6 +723,8 @@ The requested SQL Server 2025 image at level 160 is valid for level-160 behaviou
 ## 13. Organisation, accessibility, and C# 14 extensions
 
 Prefer feature-oriented organisation. Use one significant public or domain type per file by default, but keep short related types together when that improves comprehension.
+
+When creating a new .NET 10 solution, expect `dotnet new sln` to create an `.slnx` file. Use `--format sln` only where an established tool requires the legacy format.
 
 Use file-scoped namespaces in new code when that matches the repository. Avoid `Utils`, `Helpers`, and catch-all `Common` files. Name a type after the domain role it performs.
 
