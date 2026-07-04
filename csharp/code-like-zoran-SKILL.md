@@ -1,9 +1,9 @@
 ---
 name: "zoran"
-version: "4.8.3"
+version: "4.10.1"
 runtime: "required .NET 10 / C# 14 / EF Core 10 / self-hosted Microsoft SQL Server 2022"
 status: "production baseline — fixed SQL Server 2022 compatibility level 160"
-summary: "Generate clear C# for domain-heavy applications: explicit domain concepts, immutable values, behaviour-led aggregates, deliberate boundaries, EF Core mappings that respect the model, and real SQL Server provider tests where they matter."
+summary: "Generate clear C# for domain-heavy applications: explicit domain concepts, immutable values, behaviour-led aggregates, deliberate boundaries, EF Core mappings that respect the model, and MTP-native real SQL Server tests where provider behaviour matters."
 ---
 
 # Zoran-Inspired C# Domain-Modelling Skill
@@ -23,6 +23,8 @@ options.UseSqlServer(
     connectionString,
     sql => sql.UseCompatibilityLevel(160));
 ```
+
+`UseCompatibilityLevel(160)` controls EF Core's SQL-generation assumptions. It does **not** change the database setting; set and verify the database compatibility level separately.
 
 ### Production safety gate
 
@@ -174,8 +176,8 @@ public sealed record DateRange
 ### 4.3 Money, time, identifiers, and calendars
 
 - Model money as an amount plus currency. Do not pass bare `decimal` amounts across a meaningful domain boundary. A general `Money` type should not acquire a non-negative rule, a fixed scale, or an invoice-only rounding rule unless every valid use shares it; credits, refunds, adjustments, prices, and settlement amounts may require different constraints. Put those constraints on the relevant operation or a more specific type.
-- A three-character currency string is not proof that a value is an ISO 4217 code. Validate only the syntax you can prove, or validate membership against a deliberately versioned approved-code source when that is a requirement. Do not describe a length-only check as ISO validation.
-- Use `DateOnly` for dates without a time or zone and `TimeOnly` for a time-of-day. Use `DateTimeOffset` for an instant; normalise to UTC where that is a domain invariant.
+- A currency-code value is three ASCII letters with normalised casing, not proof of ISO 4217 membership; membership needs a versioned approved-code source. For fixed-scale storage, define reject-or-round behaviour and test a fresh-context boundary round trip.
+- Use `DateOnly` for dates without a time or zone and `TimeOnly` for a time-of-day. Use `DateTimeOffset` for an instant; normalise to UTC where that is a domain invariant. Name the applicable time zone where an instant establishes a business date.
 - Use `TimeProvider` or a timestamp supplied by the application service for current time when deterministic testing or auditability matters.
 - Use `ISOWeek` only where the business specification actually uses ISO 8601 weeks. Do not substitute ISO rules for fiscal or locale-specific calendars.
 - Represent absence at a boundary with an optional value. Do not use an `Empty` sentinel inside the domain.
@@ -280,11 +282,13 @@ When a reference points to an aggregate in another bounded context or external s
 
 Use a private `List<T>` and expose a read-only view for child entities. Do not return the mutable list itself. EF Core can use a conventionally named backing field for a read-only collection navigation, but cover materialisation and relationship fix-up with an integration test. Use `private set` for state changed by aggregate methods. Do not create public setters merely to satisfy persistence.
 
+Do not infer child order from database materialisation. Persist a sequence or explicit business boundary, and test reload after several children.
+
 An aggregate root is a write boundary, even when a child has its own key and an ordinary EF entity mapping. Load and mutate a child through its root for commands; a child table may still be queried directly for a read projection. A public `DbSet<TChild>` is not a licence for application commands to bypass aggregate behaviour.
 
 Use a domain foreign-key property when the child must reason about, report on, authorise against, or correlate its parent. A shadow foreign key is suitable only when that association is purely persistence metadata. When using one deliberately, configure its type, conversion, index, and column name explicitly rather than relying on a string literal and convention.
 
-Each behaviour method must validate the whole proposed state before mutation where fields constrain one another. Use named methods that describe the decision or transition; do not expose generic `Set...` methods for business state. A temporal transition must receive the facts needed to prove it is valid—such as an assessment time, due date, billing boundary, or prior event—and validate chronological order and permitted status. Do not provide `MarkOverdue()` or `SetCurrentPeriodEnd(...)` merely because a caller needs a setter when the actual policy has not been specified.
+Each behaviour method must validate the whole proposed state before mutation where fields constrain one another. Use named methods that describe the decision or transition; do not expose generic `Set...` methods for business state. A temporal transition must receive the facts needed to prove it is valid—such as an assessment time, due date, billing boundary, or prior event—and validate chronological order and permitted status. A timestamp parameter must affect the decision; otherwise omit it. Test stated time boundaries. Do not provide `MarkOverdue()` or `SetCurrentPeriodEnd(...)` merely because a caller needs a setter when the actual policy has not been specified.
 
 Whether a repeated command is a no-op, rejection, or a separate auditable action is a business decision. State that policy explicitly.
 
@@ -333,6 +337,8 @@ Do not use `field` merely because it is available. Avoid a member named `field` 
 | Finite states with variant-specific data or transitions | abstract base type with sealed variants |
 | Rules that vary independently of stored state | strategy or policy interface |
 | Boolean flags that create invalid combinations | richer type, enum, or state hierarchy |
+
+Validate untrusted ordinary-enum values with `Enum.IsDefined`; casts and deserialisation can produce undefined values. For a `[Flags]` enum, validate the permitted bit mask and prohibited combinations instead: `Enum.IsDefined` rejects unnamed but valid combinations.
 
 C# 14 does not provide compiler-enforced closed discriminated unions. A base record with sealed variants is a convention, not proof that no other subtype exists. For an important switch, include an explicit unexpected-case arm and test every known variant.
 
@@ -385,15 +391,15 @@ public interface IMoneyTransferService
 At an application boundary:
 
 1. validate transport shape and authorisation context;
-2. convert primitives to domain types;
+2. convert primitives to domain types and return malformed input as a typed rejection;
 3. load other aggregates only when their current state is needed for the rule;
 4. invoke domain behaviour;
 5. persist within the appropriate unit of work;
 6. map to a stable public result.
 
-An interface, DTOs, and entity mappings are not a completed use case. Unless the task explicitly asks for contracts only, implement the command handler or application service, its persistence boundary, and focused tests. Do not leave a public command contract with no code that validates input, loads state, invokes the aggregate, saves, and maps the outcome.
+Do not leak value-object guard exceptions for normal client input; return `Rejected`. An interface, DTOs, and entity mappings are not a completed use case. Unless the task explicitly asks for contracts only, implement the command handler or application service, its persistence boundary, and focused tests. Do not leave a public command contract with no code that validates input, loads state, invokes the aggregate, saves, and maps the outcome.
 
-Return `Rejected` for expected business-rule failures and `Conflict` for an expected stale-write outcome. Catch `DbUpdateConcurrencyException` only to produce a meaningful conflict result. A unique-key violation is provider-specific and is not a `DbUpdateConcurrencyException`; where a unique rule is part of the public contract, name the database constraint or index deterministically and translate only that known violation to the appropriate `Conflict` or `Rejected` result. Do not turn every `DbUpdateException` into a client error. Let database outages, timeouts, programming defects, and other unexpected technical faults reach the host exception boundary.
+Return `Rejected` for expected business-rule failures and `Conflict` for an expected stale-write outcome. Catch `DbUpdateConcurrencyException` only to produce a meaningful conflict result. A public `Conflict` result requires a `DbUpdateConcurrencyException` mapping and a two-context provider test. A unique-key violation is provider-specific and is not a `DbUpdateConcurrencyException`; where a unique rule is part of the public contract, name the database constraint or index deterministically and translate only that known violation to the appropriate `Conflict` or `Rejected` result. Do not turn every `DbUpdateException` into a client error. Let database outages, timeouts, programming defects, and other unexpected technical faults reach the host exception boundary.
 
 A SQL Server `rowversion` detects stale tracked writes, but it is not automatically a client-side conditional-update protocol. Where clients edit a representation and stale overwrites matter, deliberately expose and require an opaque revision or HTTP ETag, or state why server-side conflict detection alone is sufficient.
 
@@ -417,7 +423,7 @@ Use it for required fields, length, syntax, and simple ranges on transport DTOs.
 
 ### 8.2 Strict JSON
 
-For a controlled inbound JSON contract, prefer `JsonSerializerOptions.Strict`. It rejects duplicate and unmapped members, honours nullable annotations and required constructor parameters, and uses case-sensitive property matching.
+For a controlled inbound JSON contract, prefer `JsonSerializerOptions.Strict`. It rejects duplicate and unmapped members and honours nullable annotations and required constructor parameters. The preset is case-sensitive; ASP.NET Core web defaults differ, so configure and test the hosted endpoint rather than infer its behaviour.
 
 `JsonSerializerOptions.Strict` is a shared read-only preset. Create a copy before customising it. Do not place JSON attributes or converters on internal domain types merely to expose them accidentally.
 
@@ -491,7 +497,7 @@ This makes `Money` an owned entity in EF's model. Cover the mapping and replacem
 
 Choose explicit column names that are unique and intelligible within the physical table. `TotalAmount` is not invalid merely because it matches its parent complex property name: the parent is not itself a scalar column. However, `TotalAmount_Amount` or another distinctive name usually makes the schema easier to read. In EF Core 10, accidental duplicate complex-property column names are uniquified rather than silently sharing a column; intentionally shared columns require explicit configuration. Do not rely on generated suffixes as a naming convention.
 
-Use optional complex types only when absence is meaningful. For an optional complex type flattened into relational columns, EF Core must distinguish absence from an all-null instance: give it at least one required nested property, or configure a persistence-only shadow discriminator. Prefer a required nested property where it expresses a real invariant.
+Use optional complex types only when absence is meaningful. A flattened optional complex type needs either a real required nested property or an explicit persistence-only shadow discriminator; otherwise map it to JSON or redesign it. Test null and all-null materialisation.
 
 A non-nullable complex property represents a required persisted value, not a licence to invent a zero-value merely to silence nullable warnings. For a calculated value such as `TotalAmount`, prefer deriving it from the aggregate's authoritative state and leaving it unmapped. If it must be persisted as a denormalised value, assign it in every public constructor and state-transition method that establishes or changes the inputs. `= null!;` is acceptable only for EF Core's private materialisation path; it is not evidence that the domain invariant has been established. Initialise with `new Money(0, Currency.USD)` only when that exact value is unambiguously valid for every new aggregate instance.
 
@@ -507,7 +513,7 @@ builder.HasDiscriminator<string>("ProductKind")
     .HasValue<Service>("service");
 ```
 
-This entity-hierarchy discriminator is distinct from the technical shadow discriminator that can make an optional flattened complex type representable. Test persistence and base-type materialisation for every mapped concrete subtype.
+This entity-hierarchy discriminator is technical persistence metadata, not mutable domain state. Test persistence and base-type materialisation for every mapped concrete subtype.
 
 ### 9.4 Scalar value objects
 
@@ -561,7 +567,7 @@ Choose `DeleteBehavior` deliberately for every relationship whose dependents hav
 
 Keep nullable reference types enabled. C# nullability affects EF Core's required/optional conventions, so review resulting warnings and column nullability whenever a property changes.
 
-Persist economically meaningful decimals—money, rates, quantities, meter readings, and settlement values—with an explicit SQL Server precision and scale chosen from the required range and resolution. `HasPrecision` does not replace domain-side range, rounding, or currency-minor-unit rules.
+Persist economically meaningful decimals—money, rates, quantities, meter readings, and settlement values—with an explicit SQL Server precision and scale chosen from the required range and resolution. `HasPrecision` does not replace domain-side range, rounding, or currency-minor-unit rules. Before a fixed-scale mapping is used, define reject-or-round behaviour and test a fresh-context round trip at one fractional digit beyond the mapped scale.
 
 For read-only queries, project directly to DTOs and use `AsNoTracking()` where change tracking is unnecessary. Avoid loading an aggregate merely to compute a view model.
 
@@ -577,7 +583,7 @@ One `SaveChangesAsync()` call on a relational provider is transactional by defau
 
 Where lost updates matter, configure optimistic concurrency and translate `DbUpdateConcurrencyException` into `ServiceResult<T>.Conflict`. Do not silently retry a business command unless the command is demonstrably idempotent.
 
-Raise domain events in memory as part of the domain operation. Publish external messages only after durable persistence succeeds. Use an outbox when reliable delivery across the database/message boundary matters.
+Raise domain events in memory as part of the domain operation. If events are collected, expose and test an internal drain/dispatch mechanism; otherwise do not retain a private list. Publish external messages only after durable persistence succeeds. Use an outbox when reliable delivery across the database/message boundary matters.
 
 ## 10. EF Core 10 query and update patterns
 
@@ -621,7 +627,7 @@ EF Core 10 translates parameterised collection queries such as `ids.Contains(ent
 
 ### 11.1 Provider configuration
 
-The fixed platform uses `UseCompatibilityLevel(160)`. The top-of-file verification is a reminder that server version and database compatibility level are separate settings.
+The fixed platform uses `UseCompatibilityLevel(160)`. This configures EF Core translation only; `ALTER DATABASE ... SET COMPATIBILITY_LEVEL = 160` configures the database. Server version and database compatibility level are separate settings.
 
 Do not add `EnableRetryOnFailure()` automatically. It is a host resilience decision that depends on deployment topology, transaction boundaries, and command idempotency.
 
@@ -629,7 +635,7 @@ Do not add `EnableRetryOnFailure()` automatically. It is a host resilience decis
 
 Compatibility level governs database-scoped Transact-SQL and query-processing behaviour; it does not make later engine features available. Generate only features supported by both self-hosted SQL Server 2022 and compatibility level 160.
 
-At level 160, parameter-sensitive plan optimisation and cardinality-estimation feedback are enabled by default. Treat this as a reason to inspect Query Store and representative execution plans when performance matters, not as a reason to add speculative query hints or provider translation overrides.
+At level 160, parameter-sensitive plan optimisation and cardinality-estimation feedback are enabled by default; CE feedback requires Query Store to be enabled and `READ_WRITE`. Database-scoped configuration can alter defaults. Inspect the actual configuration, Query Store, and representative execution plans when performance matters; do not add speculative query hints or provider translation overrides.
 
 ### 11.3 JSON and time
 
@@ -655,27 +661,44 @@ Test at the relevant levels:
 
 Instantiate aggregates in domain tests; do not mock their behaviour. Fake or mock external boundaries only when it makes a test narrower and clearer.
 
-Use a real SQL Server database at compatibility level 160 for provider-specific mappings and important queries. For JSON, verify representative schema, generated SQL, writes, updates, and queries. For published HTTP APIs, test important request/response payloads, status codes, and OpenAPI output.
+Use a real SQL Server database at compatibility level 160 for provider-specific mappings and important queries. For JSON, verify representative schema, generated SQL, writes, updates, and queries. For published HTTP APIs, test important payloads, status codes, and OpenAPI output.
 
 For an aggregate with converted keys, complex values, private collection fields, concurrency tokens, or non-default delete behaviour, include a provider integration test that builds the model, initialises an isolated SQL Server test schema, round-trips a fresh context, verifies relationship fix-up/materialisation, and proves the expected concurrency and deletion outcomes. Isolate write tests with transactions or independent databases; do not substitute an in-memory provider for SQL Server-specific mapping tests.
 
+Unless contracts-only output was requested, test each public command’s success, expected rejection, and applicable conflict. Use a fixed time or fake `TimeProvider` unless testing the clock.
+
 Test names should describe behaviour. Arrange/Act/Assert comments are optional; use them only when they make a long test clearer.
 
-### 12.1 Real SQL Server integration tests (Testcontainers)
+### 12.1 Real SQL Server integration tests (MTP, Testcontainers, Podman)
 
-Use a real SQL Server database when a change depends on the SQL Server provider: migrations, mappings, generated SQL, JSON, constraints, collations, transactions, concurrency, delete behaviour, raw SQL, or query translation. EF InMemory and SQLite are not proof of SQL Server behaviour.
+Use this pattern when behaviour depends on SQL Server: mappings, migrations, generated SQL, JSON, constraints, transactions, concurrency, delete behaviour, raw SQL, or query translation. EF InMemory and SQLite are not substitutes for SQL Server-specific assertions.
 
-For a new test project, use a pinned current-stable **MSTest.Sdk 4.x** project SDK, `Testcontainers.MsSql`, and the same EF Core SQL Server 10.x servicing version as the application. `MSTest.Sdk` uses MTP; do not add direct `MSTest.TestFramework`, `MSTest.TestAdapter`, `MSTest.Analyzers`, or `Microsoft.NET.Test.Sdk` references unless switching deliberately to VSTest. Disable parallel execution for a shared database:
+**Runner and packages.** Each test project uses `<Project Sdk="MSTest.Sdk">`. Merge this into repository-root `global.json`:
 
-```csharp
-[assembly: DoNotParallelize]
+```json
+{
+  "msbuild-sdks": {
+    "MSTest.Sdk": "4.2.3"
+  },
+  "test": {
+    "runner": "Microsoft.Testing.Platform"
+  }
+}
 ```
 
-**Fixture pattern**
+Run `dotnet test` in native MTP mode; do not set `UseVSTest` or mix VSTest-only projects in that invocation. Pin `Testcontainers.MsSql/4.13.0` and aligned EF Core `10.0.9` packages. Do not add direct legacy MSTest, VSTest-adapter, or `Microsoft.NET.Test.Sdk` references. `MSTest.Sdk` sets its MTP bridge properties by default, but `TestingPlatformDotnetTestSupport` is not the .NET 10 native-runner selection.
 
-- Start **one container per test assembly**. A separate test project is a separate assembly and therefore starts its own container. Keep the shared assembly database serial.
-- Put the fixture in a `[TestClass]`. `[AssemblyInitialize]` must be `public static Task` or `ValueTask` with a `TestContext` parameter; `[AssemblyCleanup]` must be `public static Task` or `ValueTask` and await `DisposeAsync()`.
-- Use this exact image and pass it to the constructor; do not use a floating `latest` tag or the obsolete parameterless builder:
+**Rootless Podman on Linux.** SQL Server Linux containers require an Intel/AMD x86-64 Linux host; do not rely on x86 emulation. Before testing:
+
+```bash
+systemctl --user enable --now podman.socket
+export DOCKER_HOST="unix://${XDG_RUNTIME_DIR}/podman/podman.sock"
+dotnet test
+```
+
+Keep the Testcontainers Resource Reaper (Ryuk) enabled by default. Only after a demonstrated Podman/Ryuk failure, set `TESTCONTAINERS_RYUK_DISABLED=true`; then await `DisposeAsync()` and provide host or CI cleanup for aborted runs. `DOCKER_HOST` selects the endpoint; `TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE` concerns Ryuk only.
+
+**Fixture.** Domain/unit tests and container tests MUST be separate assemblies. In each integration-test assembly, declare `[assembly: DoNotParallelize]`; use one `MsSqlContainer` and one unique application database. A `[TestClass]` owns `public static Task` or `ValueTask` `[AssemblyInitialize]` with its `TestContext` parameter and `public static Task` or `ValueTask` `[AssemblyCleanup]`; cleanup awaits `DisposeAsync()`.
 
 ```csharp
 private const string SqlServerImage =
@@ -686,49 +709,11 @@ _container = new MsSqlBuilder(SqlServerImage)
     .Build();
 ```
 
-- `GetConnectionString()` initially targets `master`. After `await _container.StartAsync()`, use that connection only to create a unique application database and set its compatibility level **before** applying the schema:
+After `StartAsync()`, use the container’s `master` connection only to create the database. `CREATE DATABASE` MUST be its own `SqlCommand`/batch; run `ALTER DATABASE ... SET COMPATIBILITY_LEVEL = 160` in a second command. The `ALTER DATABASE` setting controls database behaviour; `UseCompatibilityLevel(160)` controls EF SQL generation. Store an application-database connection string and apply either `MigrateAsync()` or `EnsureCreatedAsync()`—never both. Rely on the module wait strategy: do not add sleeps, fixed host ports, or generic waits unless a demonstrated test-specific readiness condition needs one.
 
-```sql
-ALTER DATABASE [<test-database-name>] SET COMPATIBILITY_LEVEL = 160;
-```
+**Tests.** Each test owns its `DbContext`. For shared writes, roll back or reset; cross-context/commit tests need an independent database or reliable reset. Assertions about created rows MUST filter to test-owned IDs or a discriminator. Prove provider, compatibility level, important physical schema through SQL Server catalogue views, and a fresh-context `AsNoTracking()` round trip. Use a separate `SqlConnection` for fixture/catalogue SQL. Do not dispose `GetDbConnection()` when EF created it from a connection string; dispose it only when the caller supplied that connection.
 
-  Build and store a separate connection string whose `Initial Catalog` is that database. Apply migrations, create the schema, seed data, and run tests only through the application-database connection; never target `master`.
-- Use `MigrateAsync()` when production uses EF Core migrations; use `EnsureCreatedAsync()` only for a deliberately migration-free model. Never call both for the same database. Seed a small, read-only baseline after schema creation.
-- Configure every test context with the same level required by this skill:
-
-```csharp
-options.UseSqlServer(
-    connectionString,
-    sql => sql.UseCompatibilityLevel(160));
-```
-
-- Each test creates and disposes its own `DbContext`. Await `StartAsync()`; do not add sleeps, fixed host ports, or generic readiness checks to `MsSqlBuilder`. Never run against a developer, shared, staging, or production database.
-
-The container uses the SQL Server 2025 engine, but compatibility level 160 preserves the SQL Server 2022 database and EF translation target required by this skill. It does not prove every engine-level SQL Server 2022 behaviour; add an exact SQL Server 2022 test target only where that distinction is material.
-
-**Isolation and proof**
-
-A shared container does not make a shared database safe. Ordinary write tests should roll back their transaction or reset changed data. Tests that commit, span several contexts, or test transactions need an independent database or a reliable reset.
-
-A provider integration test must prove all relevant layers:
-
-1. Assert `db.Database.ProviderName` is `Microsoft.EntityFrameworkCore.SqlServer`; query `SERVERPROPERTY('ProductMajorVersion')` and assert `17`; query `sys.databases` for `DB_NAME()` and assert compatibility level `160`.
-2. For material mappings, assert EF model metadata such as table, primary key, precision, relationship, converter, concurrency token, or delete behaviour.
-3. Query SQL Server catalogue views such as `sys.tables`, `sys.key_constraints`, `sys.indexes`, and `sys.foreign_keys` to prove important physical schema facts. EF metadata alone is not a physical-schema assertion.
-4. Seed three to five rows, query them through a fresh `AsNoTracking()` context with deterministic ordering, and assert count and values. For a write path, save, dispose the context, reload with another context, and assert the durable result.
-
-**Rootless Podman on Linux**
-
-Before `dotnet test`, start Podman's user socket and point Testcontainers at it:
-
-```bash
-systemctl --user enable --now podman.socket
-export DOCKER_HOST="unix://${XDG_RUNTIME_DIR}/podman/podman.sock"
-export TESTCONTAINERS_RYUK_DISABLED=true
-dotnet test
-```
-
-`DOCKER_HOST` selects the Testcontainers endpoint; `TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE` does not. When Ryuk is disabled, explicit fixture disposal remains mandatory and CI should clean up abandoned containers after failed runs.
+The requested SQL Server 2025 image at level 160 is valid for level-160 behaviour and EF translation. It is not full SQL Server 2022 engine parity; engine-version-sensitive raw SQL, catalogue, and performance tests need a SQL Server 2022 or production-like CI lane.
 
 ## 13. Organisation, accessibility, and C# 14 extensions
 
@@ -751,7 +736,7 @@ For each task:
 3. Choose the smallest fitting model: primitive, value object, enum, state object, entity, DTO, or projection.
 4. Keep domain behaviour in the aggregate; keep I/O and orchestration in application or infrastructure code.
 5. Use the fixed .NET 10 / C# 14 / EF Core 10 / SQL Server 2022 compatibility-level-160 baseline, with current stable EF Core 10 package references where a package change is required.
-6. Write explicit mappings at HTTP, JSON, EF Core, and external-service boundaries; identify the composition root and test target for any persistent-model change.
+6. Write explicit mappings at HTTP, JSON, EF Core, and external-service boundaries; identify the composition root and test target for any persistent-model change. For a SQL Server integration fixture, identify MTP configuration, database-creation batch, isolation mechanism, test-owned query filters, and physical-schema assertion before writing tests.
 7. Pass cancellation through asynchronous I/O.
 8. Implement the relevant application command unless contracts only were explicitly requested; add or update focused tests that prove the important rule, mapping, or provider behaviour.
 9. Re-read public signatures for accessibility, nullability, cancellation, accidental domain leakage, incomplete public command contracts, and any preview feature; require explicit operational approval before adding one.
@@ -762,12 +747,12 @@ Before returning code, verify only the items relevant to the change:
 
 - [ ] The code targets .NET 10, C# 14, EF Core 10, and self-hosted SQL Server 2022 at compatibility level 160.
 - [ ] Package changes use the current stable EF Core 10 servicing release; prerelease packages have explicit operational approval, direct EF Core package versions are identical, and extension packages are EF Core 10-compatible.
-- [ ] SQL Server options configure `UseCompatibilityLevel(160)` in the composition root with a real connection configuration before database use.
+- [ ] SQL Server options configure `UseCompatibilityLevel(160)` in the composition root, and the database itself is separately verified at compatibility level 160.
 - [ ] Every public signature uses only accessible public types.
 - [ ] DTOs, entities, and value objects are not conflated.
 - [ ] The model is proportionate to the feature; CRUD-only and read-side work has not acquired domain ceremony without a concrete invariant or policy.
 - [ ] Domain invariants are enforced at construction and every state change.
-- [ ] A constrained record has get-only properties; `with` cannot bypass a cross-field invariant.
+- [ ] A constrained record has get-only properties; `with` cannot bypass a cross-field invariant; `[Flags]` values use bit-mask validation rather than `Enum.IsDefined`.
 - [ ] No `Empty` identifier sentinel, `FromStorage` factory, or post-construction validity ritual has been introduced.
 - [ ] A scalar value object uses an inline converter unless shared reuse, mapping hints, or conversion complexity justifies a converter class.
 - [ ] Entity mappings use `IEntityTypeConfiguration<T>` classes unless the model is genuinely trivial; owned and complex members remain configured under their owner.
@@ -779,22 +764,18 @@ Before returning code, verify only the items relevant to the change:
 - [ ] A domain `Id` is the primary key unless distinct domain and storage identities are required.
 - [ ] A unique index is not used where a relationship requires an alternate key.
 - [ ] Entity inheritance, where genuinely needed, uses an explicit shadow discriminator with stable values; `UseTphMappingStrategy()` is not added merely to restate the default.
-- [ ] Economically meaningful decimals have explicit, appropriate precision and scale.
+- [ ] Economically meaningful decimals have explicit precision/scale and a reject-or-round policy.
 - [ ] `DbContext` is short-lived and never shared concurrently.
-- [ ] Expected business rejection, unique-constraint conflict, optimistic-concurrency conflict, and unexpected technical failure remain distinct.
-- [ ] A public command has an implementation and focused tests unless contracts-only output was expressly requested.
+- [ ] Rejection, unique conflict, stale-write conflict, and technical failure remain distinct.
+- [ ] A public command has focused success, expected-rejection, and applicable concurrency tests unless contracts-only output was expressly requested.
 - [ ] A client-facing update has an explicit concurrency policy (such as opaque revision/ETag or stated server-side handling) where stale overwrites matter.
 - [ ] Bulk updates, query-filter bypasses, and raw SQL have explicit security, audit, transaction, and concurrency implications.
 - [ ] JSON and validation concerns have not leaked into the domain merely for transport convenience.
 - [ ] JSON mappings use `nvarchar(max)` storage; any JSON-path indexing uses an evidenced computed-column design, and later-engine JSON facilities are not generated.
-- [ ] Tests cover the domain rule, mapping, or provider behaviour that matters.
-- [ ] SQL Server-specific tests use an isolated Testcontainers database, not EF InMemory or SQLite.
-- [ ] The test project uses a pinned `MSTest.Sdk` 4.x project SDK; direct legacy MSTest and VSTest packages are absent unless VSTest is explicitly required.
-- [ ] The fixture uses `mcr.microsoft.com/mssql/server:2025-CU6-ubuntu-24.04`, `new MsSqlBuilder(image)`, valid public static MSTest assembly lifecycle methods, one container per test assembly, and explicit disposal.
-- [ ] The container's `master` connection is used only to create the unique application database and set compatibility level 160; migrations, schema creation, seed data, and tests use its separate application-database connection string and `UseSqlServer(...UseCompatibilityLevel(160))`.
-- [ ] Schema creation deliberately uses either migrations or `EnsureCreatedAsync`; shared writes roll back or reset, and execution is serial unless databases are independent.
-- [ ] Provider tests prove the provider, engine major version 17, compatibility level 160, important physical schema, and a fresh-context data round trip.
-- [ ] Rootless Podman uses `DOCKER_HOST` for its API socket; Ryuk-disabled runs retain explicit cleanup.
+- [ ] Tests cover the rule that matters, use a fixed clock unless testing time, and do not rely on database materialisation order.
+- [ ] `global.json` pins `MSTest.Sdk` and selects MTP; test projects use `MSTest.Sdk`; domain/unit and container suites are separate assemblies.
+- [ ] The serial fixture uses the pinned SQL Server 2025 image on supported x86-64 Linux, one container/application database, a separate `CREATE DATABASE` batch, compatibility level 160, and explicit disposal; keep Ryuk enabled unless Podman demonstrably cannot run it, then provide host/CI cleanup; engine-sensitive tests have a SQL Server 2022/prod-like lane.
+- [ ] Shared writes roll back or reset, assertions filter to test-owned data, and provider tests prove compatibility, important physical schema, and a fresh-context round trip.
 - [ ] The response does not claim unperformed inspection, execution, or testing.
 
 ## 16. Official reference points
@@ -803,6 +784,7 @@ Use the current applicable Microsoft documentation when a framework or provider 
 
 - C# 14 and `field`: https://learn.microsoft.com/dotnet/csharp/whats-new/csharp-14
 - C# records: https://learn.microsoft.com/dotnet/csharp/language-reference/builtin-types/record
+- C# enums and `Enum.IsDefined`: https://learn.microsoft.com/dotnet/csharp/language-reference/builtin-types/enum
 - C# record types and EF Core entity guidance: https://learn.microsoft.com/dotnet/csharp/fundamentals/types/records
 - .NET 10 strict JSON: https://learn.microsoft.com/dotnet/core/whats-new/dotnet-10/libraries
 - `JsonSerializerOptions.Strict`: https://learn.microsoft.com/dotnet/api/system.text.json.jsonserializeroptions.strict
@@ -824,16 +806,23 @@ Use the current applicable Microsoft documentation when a framework or provider 
 - EF Core global query filters: https://learn.microsoft.com/ef/core/querying/filters
 - EF Core testing: https://learn.microsoft.com/ef/core/testing/choosing-a-testing-strategy
 - EF Core testing against the production database system: https://learn.microsoft.com/ef/core/testing/testing-with-the-database
+- EF Core `EnsureCreated` and migrations: https://learn.microsoft.com/ef/core/managing-schemas/ensure-created
+- EF Core `GetDbConnection` ownership: https://learn.microsoft.com/dotnet/api/microsoft.entityframeworkcore.relationaldatabasefacadeextensions.getdbconnection
+- MTP overview and migration: https://learn.microsoft.com/dotnet/core/testing/migrating-vstest-microsoft-testing-platform
+- `dotnet test` runner selection: https://learn.microsoft.com/dotnet/core/tools/dotnet-test
+- Test-platform consistency: https://learn.microsoft.com/dotnet/core/testing/test-platforms-overview
 - MSTest SDK configuration and MTP: https://learn.microsoft.com/dotnet/core/testing/unit-testing-mstest-sdk
 - MSTest lifecycle: https://learn.microsoft.com/dotnet/core/testing/unit-testing-mstest-writing-tests-lifecycle
 - MSTest parallel execution: https://learn.microsoft.com/dotnet/core/testing/unit-testing-mstest-writing-tests-controlling-execution
 - Testcontainers for .NET MSSQL module: https://dotnet.testcontainers.org/modules/mssql/
 - Testcontainers for .NET configuration: https://dotnet.testcontainers.org/custom_configuration/
+- Testcontainers Resource Reaper: https://dotnet.testcontainers.org/api/resource_reaper/
 - Podman API service and rootless socket: https://docs.podman.io/en/latest/markdown/podman-system-service.1.html
 - SQL Server 2025 on Linux release notes: https://learn.microsoft.com/sql/linux/sql-server-linux-release-notes-2025?view=sql-server-ver17
 - Microsoft SQL Server container tags: https://mcr.microsoft.com/en-us/artifact/mar/mssql/server/tags
 - EF Core NuGet packages: https://learn.microsoft.com/ef/core/what-is-new/nuget-packages
 - EF Core SQL Server NuGet package: https://www.nuget.org/packages/Microsoft.EntityFrameworkCore.SqlServer/
+- SQL Server `CREATE DATABASE` batch rule: https://learn.microsoft.com/sql/t-sql/statements/create-database-transact-sql
 - SQL Server compatibility levels: https://learn.microsoft.com/sql/t-sql/statements/alter-database-transact-sql-compatibility-level
 - SQL Server 2022 features: https://learn.microsoft.com/sql/sql-server/what-s-new-in-sql-server-2022
 - Work with JSON data in SQL Server: https://learn.microsoft.com/sql/relational-databases/json/json-data-sql-server
