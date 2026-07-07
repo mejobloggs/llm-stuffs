@@ -101,6 +101,8 @@ An enum is suitable when state is merely a label. Use a state object or hierarch
 
 A library need not implement every layer. Keep Transport in the executable host. Place application orchestration where its use cases are consumed; keep Domain free of EF Core and host dependencies, and package Infrastructure separately when it is needed by a specific host.
 
+A class library with a modest model may keep Domain and Infrastructure in one assembly (separate namespaces; Domain types use no EF Core APIs) rather than forcing two projects. Split when the host, packaging, or test isolation benefit is concrete.
+
 A feature may be a class library with a small public surface, but do not force every feature into exactly one or two interfaces. Expose only the contracts a consumer genuinely needs.
 
 ## 4. Value objects
@@ -470,7 +472,9 @@ Do not wrap `DbContext` in a generic repository that only re-exposes `DbSet` met
 
 **Nested-value materialisation.** Nested complex types are supported, but EF Core cannot inject a complex or owned member into an enclosing constructor. Thus `PlanSnapshot(Money price, ...)` needs an EF materialisation path—usually a private parameterless constructor plus private setters or backing fields; scalar constructor parameters remain suitable. `OwnsOne` may be chosen for ownership or table-splitting semantics, but does not itself solve constructor binding. Cover this with a fresh-context integration test.
 
-**Nested-owned limitation.** In EF Core 10, `ComplexProperty` is exposed by `EntityTypeBuilder<T>`, not by the `OwnedNavigationBuilder<TOwner, TDependent>` supplied to an `OwnsOne` or `OwnsMany` callback. A complex type therefore cannot be configured beneath an owned entity with that Fluent API. The limitation is unrelated to records, get-only properties, `IReadOnlyCollection<T>`, or record value equality. An explicit generic `OwnsMany` overload still supplies an `OwnedNavigationBuilder`; it does not alter this limitation.
+**Nested-owned limitation.** The practical summary: you cannot call `ComplexProperty` inside an `OwnsOne`/`OwnsMany` callback — `OwnedNavigationBuilder` doesn't expose it. The workaround is to either promote the nested value to an owned entity itself (via nested `OwnsOne`), or convert the containing type to a normal entity (then `ComplexProperty` works on its `EntityTypeBuilder`).
+
+Full explanation: In EF Core 10, `ComplexProperty` is exposed by `EntityTypeBuilder<T>`, not by the `OwnedNavigationBuilder<TOwner, TDependent>` supplied to an `OwnsOne` or `OwnsMany` callback. A complex type therefore cannot be configured beneath an owned entity with that Fluent API. The limitation is unrelated to records, get-only properties, `IReadOnlyCollection<T>`, or record value equality. An explicit generic `OwnsMany` overload still supplies an `OwnedNavigationBuilder`; it does not alter this limitation.
 
 When a value beneath an owned entity would otherwise be a complex property, choose deliberately:
 
@@ -692,6 +696,7 @@ Use this pattern when behaviour depends on SQL Server: mappings, migrations, gen
 ```
 
 Run `dotnet test` in native MTP mode; do not set `UseVSTest` or mix VSTest-only projects in that invocation. Pin `Testcontainers.MsSql/4.13.0` and aligned EF Core `10.0.9` packages. Do not add direct legacy MSTest, VSTest-adapter, or `Microsoft.NET.Test.Sdk` references. `MSTest.Sdk` sets its MTP bridge properties by default, but `TestingPlatformDotnetTestSupport` is not the .NET 10 native-runner selection.
+`dotnet new mstest` generates a legacy-style `<Project Sdk="Microsoft.NET.Sdk">` with an explicit `<PackageReference Include="MSTest"/>`. Replace the entire csproj with `<Project Sdk="MSTest.Sdk">` and remove the `MSTest` package reference — the SDK brings its own. Do not mix the two.
 
 **Rootless Podman on Linux.** SQL Server Linux containers require an Intel/AMD x86-64 Linux host; do not rely on x86 emulation. Before testing:
 
@@ -708,6 +713,9 @@ Keep the Testcontainers Resource Reaper (Ryuk) enabled by default. Only after a 
 ```csharp
 private const string SqlServerImage =
     "mcr.microsoft.com/mssql/server:2025-CU6-ubuntu-24.04";
+// 2025 image — supports compat level 160 for EF generation.
+// Engine-sensitive tests (catalogue views, raw SQL, perf)
+// still need a SQL Server 2022 or production-like CI lane.
 
 _container = new MsSqlBuilder(SqlServerImage)
     .WithCleanUp(true)
@@ -801,7 +809,8 @@ Use the current applicable Microsoft documentation when a framework or provider 
 - EF Core 10 features and breaking changes: https://learn.microsoft.com/ef/core/what-is-new/ef-core-10.0/whatsnew
 - EF Core constructors: https://learn.microsoft.com/ef/core/modeling/constructors
 - EF Core value conversions: https://learn.microsoft.com/ef/core/modeling/value-conversions
-- EF Core complex types: https://learn.microsoft.com/ef/core/modeling/complex-types
+- EF Core complex types: https://learn.microsoft.com/ef/core/what-is-new/ef-core-8.0/whatsnew#complex-types
+- EF Core complex types (EF10 additions): https://learn.microsoft.com/ef/core/what-is-new/ef-core-10.0/whatsnew#complex-types
 - EF Core complex-type constructor binding limitation: https://github.com/dotnet/efcore/issues/31621
 - EF Core owned entity types: https://learn.microsoft.com/ef/core/modeling/owned-entities
 - EF Core relationship navigations: https://learn.microsoft.com/ef/core/modeling/relationships/navigations
